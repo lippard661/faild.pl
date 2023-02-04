@@ -1,6 +1,8 @@
 # faild.pl
 Script to monitor Internet connections and remote hosts for uptime and generate alerts when they go down.
 
+Also found at https://www.discord.org/lippard/software/
+
 faild.pl 1.7 of 19 December 2022
 
 Config file format (/etc/faild.conf):
