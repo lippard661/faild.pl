@@ -49,6 +49,9 @@
 #      actions.
 # 1.7: 19 December 2022: Use constant for FAILD_PID file. Fix uninitialized
 #      pings_down variable bug.
+# 1.8: 11 May 2023: Report failover steps even if not performing failover;
+#      fix bug where it reports all gateways down when current gateway goes
+#      down and we're not performing failover here.
 
 ### Required packages.
 
@@ -59,7 +62,7 @@ use Sys::Syslog;
 ### Constants.
 
 # Probably shouldn't touch.
-my $VERSION = 'faild.pl 1.7 of 19 December 2022';
+my $VERSION = 'faild.pl 1.8 of 11 May 2023';
 
 my $DEDICATED = 1;
 my $ON_DEMAND = 2;
@@ -467,7 +470,7 @@ sub report_and_failover {
     # If current gateway is not the primary, look for a higher-priority
     # gateway to fail back to.
     $changes_occurred = 0;
-    if ($new_state[$current_gateway] == $DOWN  || $current_gateway != 0) {
+    if ($new_state[$current_gateway] == $DOWN || $current_gateway != 0) {
 	for ($idx = 0; $idx <= $#GATEWAYS; $idx++) {
 	    $gate_type_name = $GATE_TYPE_NAME[$GATE_TYPE[$idx]];
 	    # If we're trying to fail back, give up when we get to the
@@ -476,26 +479,36 @@ sub report_and_failover {
 		last;
 	    }
 	    # If we find a gateway that's up, we can switch to it.
-	    elsif ($PERFORM_FAILOVER && $new_state[$idx] == $UP && $GATE_TYPE[$idx] != $HOST_CHECK) {
-		if ($new_state[$current_gateway] == $UP) {
+	    # If there's more than one gateway but we're not performing
+	    # failover here, report the failover steps even though we aren't
+	    # doing it.
+	    elsif ($new_state[$idx] == $UP && $GATE_TYPE[$idx] != $HOST_CHECK) {
+		if ($idx < $current_gateway) {
 		    &logmsg ('alert', "Failing back from gateway $current_gateway ($GATEWAYS[$current_gateway]) to gateway $idx ($GATEWAYS[$idx]).");
 		    print "Failing back from gateway $current_gateway ($GATEWAYS[$current_gateway]) to gateway $idx ($GATEWAYS[$idx]).\n" if ($DEBUG);
 		    &send_page ("faild.pl: Failing back from gateway $current_gateway ($GATEWAYS[$current_gateway]) to gateway $idx ($GATEWAYS[$idx]).");
+		    $current_gateway = $idx;
 		}
-		else {
+		elsif ($idx > $current_gateway) {
 		    &logmsg ('alert', "Failing over from gateway $current_gateway ($GATEWAYS[$current_gateway]) to gateway $idx ($GATEWAYS[$idx]).");
 		    print "Failing over from gateway $current_gateway ($GATEWAYS[$current_gateway]) to gateway $idx ($GATEWAYS[$idx]).\n" if ($DEBUG);
 		    &send_page ("faild.pl: Failing over from gateway $current_gateway ($GATEWAYS[$current_gateway]) to gateway $idx ($GATEWAYS[$idx]).");
+		    $current_gateway = $idx;
+		}
+		else {
+		    &logmsg ('alert', "Primary and current gateway $current_gateway ($GATEWAYS[$current_gateway]) is back up.");
+		    print "Primary and current gateway $current_gateway ($GATEWAYS[$current_gateway]) is back up.\n" if ($DEBUG);
+		    &send_page ("faild.pl: Primary and current gateway $current_gateway ($GATEWAYS[$current_gateway]) is back up.");
 		}
 
 		# We found something to switch to.
 		$changes_occurred = 1;
 
 		# Change routing to new gateway.
-		if ($GATE_TYPE[$idx] == $DEDICATED) {
+		if ($PERFORM_FAILOVER && $GATE_TYPE[$idx] == $DEDICATED) {
 		    system ("$ROUTE change default $GATEWAYS[$idx]");
 		}
-		else {
+		elsif ($PERFORM_FAILOVER) {
 		    # Bring up on-demand dialup PPP gateway.
 		    system ("$PPP -ddial $PPP_SYSTEM");
 		    sleep $PPP_WAIT_TIME;
@@ -508,16 +521,17 @@ sub report_and_failover {
 				$GATEWAYS[$idx] = $2;
 				$PING_IPS[$idx] = $2;
 			    }
-			}
+			} # while
 			close (IFCONF);
-		    }
+		    } #ifconfig
 		    # Routing change for on-demand gateway.
 		    system ("$ROUTE change default $GATEWAYS[$idx]");
-		}
+		} # dialup PPP
 		# ADD: Change pf config/NAT.  No, should be in place already.
-	    }
-	}
-    }
+		last;
+	    } # found up gateway
+	} # for loop
+    } # current gateway down or not on primary gateway
 
     # If there is more than one gateway and all are down, note that.
     if ($#GATEWAYS > 0 &&
