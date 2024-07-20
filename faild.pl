@@ -52,6 +52,10 @@
 # 1.8: 11 May 2023: Report failover steps even if not performing failover;
 #      fix bug where it reports all gateways down when current gateway goes
 #      down and we're not performing failover here.
+# 1.9: 3 January 2024: Converted to newer perl open format. Don't exit if
+#      current gateway is not in config.
+# 1.9a: 20 July 2024: Change error message when starting up and current gateway
+#      is not in config.
 
 ### Required packages.
 
@@ -62,7 +66,7 @@ use Sys::Syslog;
 ### Constants.
 
 # Probably shouldn't touch.
-my $VERSION = 'faild.pl 1.8 of 11 May 2023';
+my $VERSION = 'faild.pl 1.9a of 20 July 2024';
 
 my $DEDICATED = 1;
 my $ON_DEMAND = 2;
@@ -164,7 +168,7 @@ sub parse_config {
     $have_type = 0;
 
 die "Config file does not exist. $! $FAILD_CONF\n" if (!-e $FAILD_CONF);
-    open (CONFIG, $FAILD_CONF) || die "Cannot open config file for reading. $! $FAILD_CONF\n";
+    open (CONFIG, '<', $FAILD_CONF) || die "Cannot open config file for reading. $! $FAILD_CONF\n";
     while (<CONFIG>) {
 	chop;
 	if (/^\s*#|^\s*$/) {
@@ -312,7 +316,6 @@ sub initialize_states {
     if ($current_gateway == -1) {
 	&logmsg ('alert', "Current gateway ($ip) is not in faild.pl configuration.");
 	&send_page ("faild.pl: Current gateway ($ip) is not in faild.pl configuration.");
-	exit;
     }
 
     for ($idx = 0; $idx <= $#GATEWAYS; $idx++) {
@@ -322,7 +325,7 @@ sub initialize_states {
 	$pings_down[$idx] = 0;
     }
 
-    if (open (PID, ">$FAILD_PID")) {
+    if (open (PID, '>', $FAILD_PID)) {
 	print PID "$$\n";
 	close (PID);
     }
@@ -338,7 +341,7 @@ sub read_faild_info {
     $gateway_count = 0;
     $more_gateways_than_recorded = 0;
 
-    if (open (FAILD_INFO, "<$FAILD_INFO")) {
+    if (open (FAILD_INFO, '<', $FAILD_INFO)) {
 	while (<FAILD_INFO>) {
 	    chop;
 	    $gateway_count++;
@@ -359,7 +362,7 @@ sub write_faild_info {
 
     print "Entering sub write_faild_info.\n" if ($DEBUG);
 
-    if (open (FAILD_INFO, ">$FAILD_INFO")) {
+    if (open (FAILD_INFO, '>', $FAILD_INFO)) {
 	for ($idx = 0; $idx <= $#GATEWAYS; $idx++) {
 	    print FAILD_INFO "$GATEWAYS[$idx], $current_state[$idx], $state_time[$idx]\n";
 	}
@@ -490,9 +493,15 @@ sub report_and_failover {
 		    $current_gateway = $idx;
 		}
 		elsif ($idx > $current_gateway) {
-		    &logmsg ('alert', "Failing over from gateway $current_gateway ($GATEWAYS[$current_gateway]) to gateway $idx ($GATEWAYS[$idx]).");
-		    print "Failing over from gateway $current_gateway ($GATEWAYS[$current_gateway]) to gateway $idx ($GATEWAYS[$idx]).\n" if ($DEBUG);
-		    &send_page ("faild.pl: Failing over from gateway $current_gateway ($GATEWAYS[$current_gateway]) to gateway $idx ($GATEWAYS[$idx]).");
+		    if ($current_gateway == -1) {
+			&logmsg ('alert', "Starting up with gateway $idx ($GATEWAYS[$idx]).");
+			print "Starting up with gateway $idx ($GATEWAYS[$idx]).\n";
+		    }
+		    else {
+			&logmsg ('alert', "Failing over from gateway $current_gateway ($GATEWAYS[$current_gateway]) to gateway $idx ($GATEWAYS[$idx]).");
+			print "Failing over from gateway $current_gateway ($GATEWAYS[$current_gateway]) to gateway $idx ($GATEWAYS[$idx]).\n" if ($DEBUG);
+			&send_page ("faild.pl: Failing over from gateway $current_gateway ($GATEWAYS[$current_gateway]) to gateway $idx ($GATEWAYS[$idx]).");
+		    }
 		    $current_gateway = $idx;
 		}
 		else {
@@ -513,7 +522,7 @@ sub report_and_failover {
 		    system ("$PPP -ddial $PPP_SYSTEM");
 		    sleep $PPP_WAIT_TIME;
 
-		    if (open (IFCONF, "$IFCONFIG $PPP_IF|")) {
+		    if (open (IFCONF, '-|', "$IFCONFIG $PPP_IF")) {
 			while (<IFCONF>) {
 			    if (/inet (\d+\.\d+\.\d+\.\d+) --> (\d+\.\d+\.\d+\.\d+)/) {
 				# ADD: check to make sure we get something,
@@ -546,7 +555,7 @@ sub report_and_failover {
 sub gateway_ip {
     my ($ip);
 
-    open (ROUTE, "$ROUTE -n show |");
+    open (ROUTE, '-|', "$ROUTE -n show");
     while (<ROUTE>) {
         if (/^default\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s+UG/) {
 	    $ip = $1;
@@ -587,7 +596,7 @@ sub send_page {
     my ($msg) = @_;
 
     print "Sending page.\n" if ($DEBUG);
-    open (MAIL, "|$SENDMAIL -t");
+    open (MAIL, '|-', "$SENDMAIL -t");
     print MAIL "From: $PAGE_SOURCE\n";
     print MAIL "To: $PAGE_DESTINATION\n\n";
     print MAIL "$msg\n";
