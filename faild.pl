@@ -56,6 +56,8 @@
 #      current gateway is not in config.
 # 1.9a: 20 July 2024: Change error message when starting up and current gateway
 #      is not in config.
+# 1.9b: 15 June 2025: Modified to flush pf states and source tracking for
+#      current gateway when it goes down as part of failover to new gateway.
 
 ### Required packages.
 
@@ -66,7 +68,7 @@ use Sys::Syslog;
 ### Constants.
 
 # Probably shouldn't touch.
-my $VERSION = 'faild.pl 1.9a of 20 July 2024';
+my $VERSION = 'faild.pl 1.9b of 15 June 2025';
 
 my $DEDICATED = 1;
 my $ON_DEMAND = 2;
@@ -114,6 +116,7 @@ my $FAILD_INFO = '/var/run/faild.info';
 my $FAILD_PID = '/var/run/faild.pid';
 
 my $IFCONFIG = '/usr/sbin/ifconfig';
+my $PFCTL = '/sbin/pfctl';
 my $PPP = '/usr/sbin/ppp';
 my $ROUTE = '/sbin/route';
 my $SENDMAIL = '/usr/sbin/sendmail';
@@ -515,7 +518,12 @@ sub report_and_failover {
 
 		# Change routing to new gateway.
 		if ($PERFORM_FAILOVER && $GATE_TYPE[$idx] == $DEDICATED) {
+		    # Change default route.
 		    system ("$ROUTE change default $GATEWAYS[$idx]");
+		    # Flush pf source tracking for down current gateway.
+		    system ("$PFCTL -F Sources -K $GATEWAYS[$current_gateway]");
+		    # Flush pf states for down current gateway.
+		    system ("$PFCTL -F states -k $GATEWAYS[$current_gateway]");
 		}
 		elsif ($PERFORM_FAILOVER) {
 		    # Bring up on-demand dialup PPP gateway.
