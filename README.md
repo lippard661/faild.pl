@@ -3,7 +3,7 @@ Script to monitor Internet connections and remote hosts for uptime and generate 
 
 Also found at https://www.discord.org/lippard/software/
 
-faild.pl 1.9a of 20 July 2024
+faild.pl 1.9b of 15 June 2025
 
 Config file format (/etc/faild.conf):
 <PRE>
