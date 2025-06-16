@@ -519,7 +519,7 @@ sub report_and_failover {
 		# Change routing to new gateway.
 		if ($PERFORM_FAILOVER && $GATE_TYPE[$idx] == $DEDICATED) {
 		    # Change default route.
-		    system ("$ROUTE change default $GATEWAYS[$idx]");
+		    system ("$ROUTE -n change default $GATEWAYS[$idx]");
 		    # Flush pf source tracking for down current gateway.
 		    system ("$PFCTL -F Sources -K $GATEWAYS[$current_gateway]");
 		    # Flush pf states for down current gateway.
