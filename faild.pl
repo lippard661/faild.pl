@@ -182,10 +182,11 @@ if ($^O eq "openbsd") {
     unveil ($PPP, 'rx');
     unveil ($ROUTE, 'rx');
     unveil ($SENDMAIL, 'rx');
-    unveil ();
+    # don't lock yet.
 }
 
 &parse_config;
+unveil () if ($^O eq "openbsd"); # done unveiling after config is parsed
 &initialize_states;
 Sys::Syslog::setlogsock('unix');
 &read_faild_info;
@@ -274,6 +275,7 @@ die "Config file does not exist. $! $FAILD_CONF\n" if (!-e $FAILD_CONF);
 		die "Already have an interface for gateway. $_\n";
 	    }
 	    push (@INTERFACES, $1);
+	    unveil ("/etc/hostname.$1", 'r') if ($^O eq "openbsd");
 	    $have_interface = 1;
 	}
 	elsif (/^\s*ping_ip:\s*(.*)$/) {
