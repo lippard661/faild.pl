@@ -500,13 +500,18 @@ sub get_dhcplease_info {
     my ($interface) = @_;
     my ($dhcpleaseinfo, $interface_ip, $netmask, $gateway_ip, $lease_time, $units);
 
+    print "Entering sub get_dhcplease_info.\n" if ($DEBUG);
+
     $dhcpleaseinfo = `$DHCPLEASECTL -l $interface`;
-    if ($dhcpleaseinfo =~ /inet (\d+\.\d+\.\d+\.\d+) netmask (\d+\.\d+\.\d+\.\d+).*default gateway (\d+\.\d+\.\d+\.\d+).*lease (\d+) (hours|minutes)/) {
+    if ($dhcpleaseinfo =~ /inet (\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}) netmask (\d+\.\d+\.\d+\.\d+).*default gateway (\d+\.\d+\.\d+\.\d+).*lease (\d+) (hours|minutes)/s) {
 	$interface_ip = $1;
 	$netmask = $2;
 	$gateway_ip = $3;
 	$lease_time = $4;
 	$units = $5;
+    }
+    else {
+	print "Could not parse dhcpleasectl info. $dhcpleaseinfo\n" if ($DEBUG);
     }
     return ($interface_ip, $netmask, $gateway_ip, $lease_time, $units);
 }
