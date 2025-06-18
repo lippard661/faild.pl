@@ -254,8 +254,8 @@ die "Config file does not exist. $! $FAILD_CONF\n" if (!-e $FAILD_CONF);
 	    if ($gateway_idx > -1) {
 		die "New gateway line when no ping_ip specified for previous gateway. $_\n" if (!$have_ping_ip);
 		die "New gateway line when no type specified for previous gateway. $_\n" if (!$have_type);
-		die "New gateway line when no interface specified for previous dedicated-dhcplease gateway. $_\n" if ($have_type && $GATE_TYPE[$gateway_idx] == $DEDICATED_DHCPLEASE_PRIMARY ||
-												  $GATE_TYPE[$gateway_idx] == $DEDICATED_DHCPLEASE_BACKUP);
+		die "New gateway line when no interface specified for previous dedicated-dhcplease gateway. $_\n" if (!$have_interface && ($GATE_TYPE[$gateway_idx] == $DEDICATED_DHCPLEASE_PRIMARY ||
+																	   $GATE_TYPE[$gateway_idx] == $DEDICATED_DHCPLEASE_BACKUP));
 	    }
 	    if (&is_ipaddr ($1)) {
 		push (@GATEWAYS, $1);
