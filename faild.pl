@@ -16,20 +16,28 @@
 # # Comment format
 # page_source: email-addr (where alerts are sent from)
 # page_destination: email-addr (where alerts are sent to)
+# perform_failover: [yes|no] (optional, default no)
 # # Then as many of these triplets as you want:
 # gateway: <ip>
+# interface: <interface name> [optional, but needed for dhcplease]
 # ping_ip: <ip>
-# type: <dedicated|on-demand|host>
+# type: <dedicated|dedicated-dhcplease-primary|dedicated-dhcplease-backup|on-demand|host>
 
 # Issues/To Do:
-# 1. PPP on-demand needs completion, need to handle failback/modem hangup.
-#    Need to do appropriate NAT.  (Note that ppp already adds a default
-#    route.)
-# 2. Need to implement failover for pf rules.  Use tables?  I don't think
-#    that will work for NAT rules.
-# 3. Need to do an ifconfig $PPP_IF down/ifconfig $PPP_IF delete at
+# (reworked)
+# 1. Allow specifying an amount of downtime before failover (e.g., to avoid
+#    a one-minute downtime change). Default should be 2 min. (DONE)
+# 1a.  Command line and/or config file option for whether failover should
+#      occur. (DONE, config)
+# 2. Allow more control over what failover actions occur -- e.g.,
+#    checking dhcpleasectl info on gateways, making additional
+#    routing changes, error checking. (DONE, sort of)
+# 3. IPv6 support. (currently using tunnel on one interface)
+# 4. PPP on-demand needs completion to handle failback/modem hangup,
+#    possible NAT. (Not using this anymore, so unlikely to happen.)
+# 5. Need to do an ifconfig $PPP_IF down/ifconfig $PPP_IF delete at
 #    failback.
-# 4. IPv6 support.
+
 # Alternative:
 # ppp -auto.  When failover occurs, just change the default route,
 #   send some traffic (to where?), and sleep for $PPP_WAIT_TIME
@@ -58,6 +66,9 @@
 #      is not in config.
 # 1.9b: 15 June 2025: Modified to flush pf states and source tracking for
 #      current gateway when it goes down as part of failover to new gateway.
+# 1.10: 16-17 June 2025: Modified to not failover until 2 minutes of downtime.
+#      Add dedicated-dhcplease-(primary/backup) types and renew leases before they expire.
+#      Use pledge and unveil.
 
 ### Required packages.
 
@@ -65,15 +76,25 @@ use strict;
 use Net::Ping;
 use Sys::Syslog;
 
+use if $^O eq "openbsd", "OpenBSD::Pledge";
+use if $^O eq "openbsd", "OpenBSD::Unveil";
+
 ### Constants.
 
 # Probably shouldn't touch.
-my $VERSION = 'faild.pl 1.9b of 15 June 2025';
+my $VERSION = 'faild.pl 1.10 of 17 June 2025';
 
 my $DEDICATED = 1;
-my $ON_DEMAND = 2;
-my $HOST_CHECK = 3;
-my @GATE_TYPE_NAME = ('', 'Gateway', 'On-demand gateway', 'Host');
+my $DEDICATED_DHCPLEASE_PRIMARY = 2;
+my $DEDICATED_DHCPLEASE_BACKUP = 3;
+my $ON_DEMAND = 4;
+my $HOST_CHECK = 5;
+my @GATE_TYPE_NAME = ('',
+		      'Gateway',
+		      'Gateway (DHCP primary)',
+		      'Gateway (DHCP backup)',
+		      'On-demand gateway',
+		      'Host');
 
 my $UP = 1;
 my $DOWN = 0;
@@ -82,6 +103,9 @@ my $DOWN = 0;
 my $DEBUG = 0;
 
 my $PERFORM_FAILOVER = 0;
+
+# Number of minutes of downtime before failover.
+my $FAILOVER_DELAY_MINUTES = 2;
 
 # Number of seconds to wait between gateway checks.
 my $SLEEP_TIME = 60;
@@ -103,7 +127,7 @@ my %PING_NAME = (1, 'first',
 		 9, 'ninth',
 		 10, 'tenth');
 
-my (@GATEWAYS, @PING_IPS, @GATE_TYPE);
+my (@GATEWAYS, @INTERFACES, @PING_IPS, @GATE_TYPE);
 
 # Name of PPP system to use in /etc/ppp/ppp.conf.
 my $PPP_SYSTEM = 'pmdemand';
@@ -115,6 +139,8 @@ my $FAILD_CONF = '/etc/faild.conf';
 my $FAILD_INFO = '/var/run/faild.info';
 my $FAILD_PID = '/var/run/faild.pid';
 
+my $BIN_SH = '/bin/sh';
+my $DHCPLEASECTL = '/usr/sbin/dhcpleasectl';
 my $IFCONFIG = '/usr/sbin/ifconfig';
 my $PFCTL = '/sbin/pfctl';
 my $PPP = '/usr/sbin/ppp';
@@ -142,6 +168,23 @@ if ($#ARGV == 0) {
     }
 }
 
+# Pledge, Unveil.
+if ($^O eq "openbsd") {
+    pledge ('rpath', 'wpath', 'cpath', 'unveil', 'proc', 'exec', 'inet', 'unix') || die "Cannot pledge promises. $!\n";
+    unveil ($FAILD_CONF, 'r');
+    unveil ('/etc/protocols', 'r');
+    unveil ('/var/run', 'rwc');
+    unveil ('/dev/log', 'rw');
+    unveil ($BIN_SH, 'rx');
+    unveil ($DHCPLEASECTL, 'rx');
+    unveil ($IFCONFIG, 'rx');
+    unveil ($PFCTL, 'rx');
+    unveil ($PPP, 'rx');
+    unveil ($ROUTE, 'rx');
+    unveil ($SENDMAIL, 'rx');
+    unveil ();
+}
+
 &parse_config;
 &initialize_states;
 Sys::Syslog::setlogsock('unix');
@@ -163,10 +206,11 @@ exit;
 
 # Parse config file.
 sub parse_config {
-    my ($have_page_source, $have_page_destination, $gateway_idx, $have_ping_ip, $have_type);
+    my ($have_page_source, $have_page_destination, $gateway_idx, $have_interface, $have_ping_ip, $have_type);
     $have_page_source = 0;
     $have_page_destination = 0;
     $gateway_idx = -1;
+    $have_interface = 0;
     $have_ping_ip = 0;
     $have_type = 0;
 
@@ -195,6 +239,17 @@ die "Config file does not exist. $! $FAILD_CONF\n" if (!-e $FAILD_CONF);
 		die "page_destination must be an email address. $_\n";
 	    }	    
 	}
+	elsif (/^\s*perform_failover:\s*(.*)$/) {
+	    if ($1 eq 'yes') {
+		$PERFORM_FAILOVER = 1;
+	    }
+	    elsif ($1 eq 'no') {
+		$PERFORM_FAILOVER = 0;
+	    }
+	    else {
+		die "perform_failover must be \"yes\" or \"no\", not \"$1\".\n";
+	    }
+	}
 	elsif (/^\s*gateway:\s*(.*)$/) {
 	    if ($gateway_idx > -1 &&
 		(!$have_ping_ip || !$have_type)) {
@@ -203,12 +258,21 @@ die "Config file does not exist. $! $FAILD_CONF\n" if (!-e $FAILD_CONF);
 	    if (&is_ipaddr ($1)) {
 		push (@GATEWAYS, $1);
 		$gateway_idx++;
+		$have_interface = 0;
 		$have_ping_ip = 0;
 		$have_type = 0;
 	    }
 	    else {
 		die "gateway must be an IPv4 address. $_\n";
 	    }
+	}
+	# Optional.
+	elsif (/^\s*interface:\s*(.*)$/) {
+	    if ($have_interface) {
+		die "Already have an interface for gateway. $_\n";
+	    }
+	    push (@INTERFACES, $1);
+	    $have_interface = 1;
 	}
 	elsif (/^\s*ping_ip:\s*(.*)$/) {
 	    if ($have_ping_ip) {
@@ -225,6 +289,12 @@ die "Config file does not exist. $! $FAILD_CONF\n" if (!-e $FAILD_CONF);
 	    }
 	    if ($1 eq 'dedicated') {
 		push (@GATE_TYPE, $DEDICATED);
+	    }
+	    elsif ($1 eq 'dedicated-dhcplease-primary') {
+		push (@GATE_TYPE, $DEDICATED_DHCPLEASE_PRIMARY);
+	    }
+	    elsif ($1 eq 'dedicated-dhcplease-backup') {
+		push (@GATE_TYPE, $DEDICATED_DHCPLEASE_BACKUP);
 	    }
 	    elsif ($1 eq 'on-demand') {
 		push (@GATE_TYPE, $ON_DEMAND);
@@ -251,6 +321,10 @@ die "Config file does not exist. $! $FAILD_CONF\n" if (!-e $FAILD_CONF);
     }
     if ($gateway_idx == -1) {
 	die "No gateway in config. $FAILD_CONF\n";
+    }
+    if (!$have_interface) {
+# not required
+#	die "Missing interface in config. $FALD_CONFIG\n";
     }
     if (!$have_ping_ip) {
 	die "Missing ping_ip in config. $FAILD_CONF\n";
@@ -421,10 +495,27 @@ sub ping_gateways {
     }
 }
 
+# Subroutine to return dhcpleased information for an interface.
+sub get_dhcplease_info {
+    my ($interface) = @_;
+    my ($dhcpleaseinfo, $interface_ip, $netmask, $gateway_ip, $lease_time, $units);
+
+    $dhcpleaseinfo = `$DHCPLEASECTL -l $interface`;
+    if ($dhcpleaseinfo =~ /inet (\d+\.\d+\.\d+\.\d+) netmask (\d+\.\d+\.\d+\.\d+).*default gateway (\d+\.\d+\.\d+\.\d+).*lease (\d+) (hours|minutes)/) {
+	$interface_ip = $1;
+	$netmask = $2;
+	$gateway_ip = $3;
+	$lease_time = $4;
+	$units = $5;
+    }
+    return ($interface_ip, $netmask, $gateway_ip, $lease_time, $units);
+}
+
 # Subroutine to report any state changes and failover to another
 # gateway if necessary and possible.
 sub report_and_failover {
     my ($changes_occurred, $idx, $duration, $plural);
+    my ($interface_ip, $netmask, $gateway_ip, $lease_time, $units);
 
     print "Entering sub report_and_failover.\n" if ($DEBUG);
 
@@ -432,6 +523,40 @@ sub report_and_failover {
     $changes_occurred = 0;
     for ($idx = 0; $idx <= $#GATEWAYS; $idx++) {
 	$gate_type_name = $GATE_TYPE_NAME[$GATE_TYPE[$idx]];
+
+	# Check for expiring leases and renew to try to prevent fake outages.
+	if (($GATE_TYPE[$idx] == $DEDICATED_DHCPLEASE_PRIMARY
+	     || $GATE_TYPE[$idx] == $DEDICATED_DHCPLEASE_BACKUP)
+	    && defined ($INTERFACES[$idx])
+	    && $new_state[$idx] == $UP) {
+	    ($interface_ip, $netmask, $gateway_ip, $lease_time, $units) =
+		&get_dhcplease_info ($INTERFACES[$idx]);
+	    if ($lease_time == 1) {
+		# renew lease before expiration (an hour early for a 24-hr lease
+		# or a minute early for a one hour lease).
+		system ($DHCPLEASECTL, $INTERFACES[$idx]);
+		# See if gateway changed.
+		my ($new_interface_ip, $new_netmask, $new_gateway_ip, $new_lease_time, $new_units) =
+		    &get_dhcplease_info ($INTERFACES[$idx]);
+		if ($new_interface_ip ne $interface_ip || $new_netmask ne $netmask ||
+		    $new_gateway_ip ne $gateway_ip) {
+		    # Flush states for old gateway ip.
+		    system ("$PFCTL -F states -k $gateway_ip");
+		    my $message = "New DHCP lease for $gate_type_name $idx: interface IP $interface_ip netmask $netmask gateway $gateway_ip->$new_interface_ip $new_netmask gateway $new_gateway_ip.";
+		    &logmsg ('alert', $message);
+		    print "$message\n" if ($DEBUG);
+		    &send_page ("faild.pl: $message");
+		    $gateway_ip = $new_gateway_ip;
+		}
+		# remove default route if this is a backup that is not the current
+		# gateway -- dhcpleased will have added it (assuming multipath routing).
+		if ($idx != $current_gateway && $GATE_TYPE[$idx] == $DEDICATED_DHCPLEASE_BACKUP) {
+		    system ($ROUTE, '-n', 'delete', 'default', $gateway_ip);
+		    # Maybe also run /bin/sh /etc/netstart /etc/hostname.interface?
+		}
+	    }
+	}
+
 	if ($current_state[$idx] != $new_state[$idx]) {
 	    $changes_occurred = 1;
 	    $duration = time() - $state_time[$idx];
@@ -476,7 +601,8 @@ sub report_and_failover {
     # If current gateway is not the primary, look for a higher-priority
     # gateway to fail back to.
     $changes_occurred = 0;
-    if ($new_state[$current_gateway] == $DOWN || $current_gateway != 0) {
+    if (($new_state[$current_gateway] == $DOWN &&
+	 $duration >= $FAILOVER_DELAY_MINUTES) || $current_gateway != 0) {
 	for ($idx = 0; $idx <= $#GATEWAYS; $idx++) {
 	    $gate_type_name = $GATE_TYPE_NAME[$GATE_TYPE[$idx]];
 	    # If we're trying to fail back, give up when we get to the
@@ -517,13 +643,13 @@ sub report_and_failover {
 		$changes_occurred = 1;
 
 		# Change routing to new gateway.
-		if ($PERFORM_FAILOVER && $GATE_TYPE[$idx] == $DEDICATED) {
+		if ($PERFORM_FAILOVER && ($GATE_TYPE[$idx] == $DEDICATED ||
+					  $GATE_TYPE[$idx] == $DEDICATED_DHCPLEASE_PRIMARY ||
+					  $GATE_TYPE[$idx] == $DEDICATED_DHCPLEASE_BACKUP)) {
 		    # Change default route.
-		    system ("$ROUTE -n change default $GATEWAYS[$idx]");
-		    # Flush pf source tracking for down current gateway.
-		    system ("$PFCTL -F Sources -K $GATEWAYS[$current_gateway]");
+		    system ($ROUTE, '-n', 'change', 'default', $GATEWAYS[$idx]);
 		    # Flush pf states for down current gateway.
-		    system ("$PFCTL -F states -k $GATEWAYS[$current_gateway]");
+		    system ($PFCTL, '-F', 'states', '-k', $GATEWAYS[$current_gateway]);
 		}
 		elsif ($PERFORM_FAILOVER) {
 		    # Bring up on-demand dialup PPP gateway.
@@ -542,7 +668,7 @@ sub report_and_failover {
 			close (IFCONF);
 		    } #ifconfig
 		    # Routing change for on-demand gateway.
-		    system ("$ROUTE change default $GATEWAYS[$idx]");
+		    system ($ROUTE, 'change', 'default', $GATEWAYS[$idx]);
 		} # dialup PPP
 		# ADD: Change pf config/NAT.  No, should be in place already.
 		last;
