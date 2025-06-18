@@ -251,9 +251,11 @@ die "Config file does not exist. $! $FAILD_CONF\n" if (!-e $FAILD_CONF);
 	    }
 	}
 	elsif (/^\s*gateway:\s*(.*)$/) {
-	    if ($gateway_idx > -1 &&
-		(!$have_ping_ip || !$have_type)) {
-		die "New gateway line when no ping_ip or type specified for previous gateway. $_\n";
+	    if ($gateway_idx > -1) {
+		die "New gateway line when no ping_ip specified for previous gateway. $_\n" if (!$have_ping_ip);
+		die "New gateway line when no type specified for previous gateway. $_\n" if (!$have_type);
+		die "New gateway line when no interface specified for previous dedicated-dhcplease gateway. $_\n" if ($have_type && $GATE_TYPE[$gateway_idx] == $DEDICATED_DHCPLEASE_PRIMARY ||
+												  $GATE_TYPE[$gateway_idx] == $DEDICATED_DHCPLEASE_BACKUP);
 	    }
 	    if (&is_ipaddr ($1)) {
 		push (@GATEWAYS, $1);
@@ -266,7 +268,7 @@ die "Config file does not exist. $! $FAILD_CONF\n" if (!-e $FAILD_CONF);
 		die "gateway must be an IPv4 address. $_\n";
 	    }
 	}
-	# Optional.
+	# Optional except for dedicated-dhcplease types.
 	elsif (/^\s*interface:\s*(.*)$/) {
 	    if ($have_interface) {
 		die "Already have an interface for gateway. $_\n";
@@ -322,9 +324,10 @@ die "Config file does not exist. $! $FAILD_CONF\n" if (!-e $FAILD_CONF);
     if ($gateway_idx == -1) {
 	die "No gateway in config. $FAILD_CONF\n";
     }
+    # These checks need to occur for each gateway.
     if (!$have_interface) {
-# not required
-#	die "Missing interface in config. $FALD_CONFIG\n";
+	die "Missing interface in config for dedicated-dhcplease gateway. $FAILD_CONF\n" if ($have_type && $GATE_TYPE[$gateway_idx] == $DEDICATED_DHCPLEASE_PRIMARY ||
+							       $GATE_TYPE[$gateway_idx] == $DEDICATED_DHCPLEASE_BACKUP);
     }
     if (!$have_ping_ip) {
 	die "Missing ping_ip in config. $FAILD_CONF\n";
@@ -332,6 +335,7 @@ die "Config file does not exist. $! $FAILD_CONF\n" if (!-e $FAILD_CONF);
     if (!$have_type) {
 	die "Missing type in config. $FAILD_CONF\n";
     }
+
 }
 
 # Subroutine to do rudimentary email address check.
@@ -521,6 +525,7 @@ sub get_dhcplease_info {
 sub report_and_failover {
     my ($changes_occurred, $idx, $duration, $plural);
     my ($interface_ip, $netmask, $gateway_ip, $lease_time, $units);
+    my ($prior_gateway);
 
     print "Entering sub report_and_failover.\n" if ($DEBUG);
 
@@ -557,7 +562,7 @@ sub report_and_failover {
 		# gateway -- dhcpleased will have added it (assuming multipath routing).
 		if ($idx != $current_gateway && $GATE_TYPE[$idx] == $DEDICATED_DHCPLEASE_BACKUP) {
 		    system ($ROUTE, '-n', 'delete', 'default', $gateway_ip);
-		    # Maybe also run /bin/sh /etc/netstart /etc/hostname.interface?
+		    # Maybe also run /bin/sh /etc/netstart /etc/hostname.interface?  No, only do during state change to UP.
 		}
 	    }
 	}
@@ -574,6 +579,13 @@ sub report_and_failover {
 		if ($duration > 15) {
 		    &send_page ("faild.pl: $gate_type_name $idx ($GATEWAYS[$idx]) is again reachable (down $duration minute$plural).");
 		}
+		# A newly up gateway that we may or may not be switching to,
+		# depending on whether multiple were down.  We may end up
+		# using it, which is handled further below.
+		# Run netstart on interface. This might delete
+		# a default route (for a backup dhcplease interface), but
+		# if we're going to start using it that will be fixed below.
+		system ($BIN_SH, '/etc/netstart', "/etc/hostname.$INTERFACES[$current_gateway]");
 	    }
 	    else {
 		&logmsg ('alert', "$gate_type_name $idx ($GATEWAYS[$idx]) has gone down (up $duration minute$plural).");
@@ -606,6 +618,7 @@ sub report_and_failover {
     # If current gateway is not the primary, look for a higher-priority
     # gateway to fail back to.
     $changes_occurred = 0;
+    $prior_gateway = $current_gateway;
     if (($new_state[$current_gateway] == $DOWN &&
 	 $duration >= $FAILOVER_DELAY_MINUTES) || $current_gateway != 0) {
 	for ($idx = 0; $idx <= $#GATEWAYS; $idx++) {
@@ -651,10 +664,15 @@ sub report_and_failover {
 		if ($PERFORM_FAILOVER && ($GATE_TYPE[$idx] == $DEDICATED ||
 					  $GATE_TYPE[$idx] == $DEDICATED_DHCPLEASE_PRIMARY ||
 					  $GATE_TYPE[$idx] == $DEDICATED_DHCPLEASE_BACKUP)) {
-		    # Change default route.
+		    # Change default route.  (Might need to add if there isn't one.)
 		    system ($ROUTE, '-n', 'change', 'default', $GATEWAYS[$idx]);
-		    # Flush pf states for down current gateway.
-		    system ($PFCTL, '-F', 'states', '-k', $GATEWAYS[$current_gateway]);
+		    system ($ROUTE, '-n', 'add', 'default', $GATEWAYS[$idx]);
+		    
+		    # Flush routes from prior gateway.
+		    system ($ROUTE, 'flush', '-iface', $INTERFACES[$prior_gateway]);
+		    # Flush pf states for prior gateway.
+		    system ($PFCTL, '-F', 'states', '-k', $GATEWAYS[$prior_gateway]);
+
 		}
 		elsif ($PERFORM_FAILOVER) {
 		    # Bring up on-demand dialup PPP gateway.
