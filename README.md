@@ -11,8 +11,8 @@ Config file format (/etc/faild.conf):
  page_source: email-addr (where alerts are sent from)
  page_destination: email-addr (where alerts are sent to)
  # Then as many of these triplets as you want:
- gateway: <ip>
- interface: <interface> # optional, used by dhcplease-primary/backup
- ping_ip: <ip>
- type: <dedicated|dedicated-dhcplease-primary|dedicated-dhcplease-backup|on-demand|host>
+ gateway: &lt;ip&gt;
+ interface: &lt;interface&gt; # optional, used by dhcplease-primary/backup
+ ping_ip: &lt;ip&gt;
+ type: &lt;dedicated|dedicated-dhcplease-primary|dedicated-dhcplease-backup|on-demand|host&gt;
   </PRE>
