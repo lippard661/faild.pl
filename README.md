@@ -3,7 +3,7 @@ Script to monitor Internet connections and remote hosts for uptime and generate 
 
 Also found at https://www.discord.org/lippard/software/
 
-faild.pl 1.10 of 17 June 2025
+faild.pl 1.11 of 3 July 2025
 
 Config file format (/etc/faild.conf):
 <PRE>
@@ -13,6 +13,7 @@ Config file format (/etc/faild.conf):
  # Then as many of these triplets as you want:
  gateway: &lt;ip&gt;
  interface: &lt;interface&gt; # optional, used by dhcplease-primary/backup
+ routes: &lt;cidr&gt;,&ltcidr&gt,... # optional, only for dhcplease-primary/backup
  ping_ip: &lt;ip&gt;
  type: &lt;dedicated|dedicated-dhcplease-primary|dedicated-dhcplease-backup|on-demand|host&gt;
   </PRE>
