@@ -20,6 +20,7 @@
 # # Then as many of these triplets as you want:
 # gateway: <ip>
 # interface: <interface name> [optional, but needed for dhcplease]
+# routes: <cidr>, <cidr>, <cidr> [optional only for dhcplease]
 # ping_ip: <ip>
 # type: <dedicated|dedicated-dhcplease-primary|dedicated-dhcplease-backup|on-demand|host>
 
@@ -69,6 +70,7 @@
 # 1.10: 16-17 June 2025: Modified to not failover until 2 minutes of downtime.
 #      Add dedicated-dhcplease-(primary/backup) types and renew leases before they expire.
 #      Use pledge and unveil.
+# 1.11 3 July 2025: Modified to allow adding specific routes to a gateway.
 
 ### Required packages.
 
@@ -82,7 +84,7 @@ use if $^O eq "openbsd", "OpenBSD::Unveil";
 ### Constants.
 
 # Probably shouldn't touch.
-my $VERSION = 'faild.pl 1.10 of 17 June 2025';
+my $VERSION = 'faild.pl 1.11 of 3 July 2025';
 
 my $DEDICATED = 1;
 my $DEDICATED_DHCPLEASE_PRIMARY = 2;
@@ -127,7 +129,7 @@ my %PING_NAME = (1, 'first',
 		 9, 'ninth',
 		 10, 'tenth');
 
-my (@GATEWAYS, @INTERFACES, @PING_IPS, @GATE_TYPE);
+my (@GATEWAYS, @INTERFACES, @ROUTES, @PING_IPS, @GATE_TYPE);
 
 # Name of PPP system to use in /etc/ppp/ppp.conf.
 my $PPP_SYSTEM = 'pmdemand';
@@ -207,11 +209,12 @@ exit;
 
 # Parse config file.
 sub parse_config {
-    my ($have_page_source, $have_page_destination, $gateway_idx, $have_interface, $have_ping_ip, $have_type);
+    my ($have_page_source, $have_page_destination, $gateway_idx, $have_interface, $have_routes, $have_ping_ip, $have_type);
     $have_page_source = 0;
     $have_page_destination = 0;
     $gateway_idx = -1;
     $have_interface = 0;
+    $have_routes = 0;
     $have_ping_ip = 0;
     $have_type = 0;
 
@@ -262,6 +265,7 @@ die "Config file does not exist. $! $FAILD_CONF\n" if (!-e $FAILD_CONF);
 		push (@GATEWAYS, $1);
 		$gateway_idx++;
 		$have_interface = 0;
+		$have_routes = 0;
 		$have_ping_ip = 0;
 		$have_type = 0;
 	    }
@@ -274,9 +278,22 @@ die "Config file does not exist. $! $FAILD_CONF\n" if (!-e $FAILD_CONF);
 	    if ($have_interface) {
 		die "Already have an interface for gateway. $_\n";
 	    }
-	    push (@INTERFACES, $1);
+	    $INTERFACES[$gateway_idx] = $1;
 	    unveil ("/etc/hostname.$1", 'r') if ($^O eq "openbsd");
 	    $have_interface = 1;
+	}
+	# Optional, only for dedicated-dhcplease types.
+	elsif (/^\s*routes:\s*(.*)$/) {
+	    if ($have_routes) {
+		die "Already have specific routes for gateway. $_\n";
+	    }
+	    $ROUTES[$gateway_idx] = $1;
+	    # remove any whitespace
+	    $ROUTES[$gateway_idx] =~ s/\s//g;
+	    if (!&valid_routes ($ROUTES[$gateway_idx])) {
+		die "Invalid specific routes. $ROUTES[$gateway_idx]\n";
+	    }
+	    $have_routes = 1;
 	}
 	elsif (/^\s*ping_ip:\s*(.*)$/) {
 	    if ($have_ping_ip) {
@@ -337,7 +354,10 @@ die "Config file does not exist. $! $FAILD_CONF\n" if (!-e $FAILD_CONF);
     if (!$have_type) {
 	die "Missing type in config. $FAILD_CONF\n";
     }
-
+    if ($have_routes && $GATE_TYPE[$gateway_idx] != $DEDICATED_DHCPLEASE_PRIMARY &&
+	$GATE_TYPE[$gateway_idx] != $DEDICATED_DHCPLEASE_BACKUP) {
+	die "Specific routes specified for non-dedicated DHCP gateway.\n";
+    }
 }
 
 # Subroutine to do rudimentary email address check.
@@ -385,6 +405,24 @@ sub is_octet {
     else {
 	return 0;
     }
+}
+
+# Subroutine to check format of specific routes list. IPv4 only.
+sub valid_routes {
+    my ($routes) = @_;
+    my (@route_array, $route, $ipaddr, $mask);
+
+    @route_array = split (/,/, $routes);
+    foreach $route (@route_array) {
+	($ipaddr, $mask) = split (/\//, $route);
+	if (!defined ($ipaddr) || !&is_ipaddr ($ipaddr)) {
+	    return 0;
+	}
+	if ($mask !~ /^\d+$/ || $mask < 1 || $mask > 32) {
+	    return 0;
+	}
+    }
+    return 1;
 }
 
 # Initialize states with up, since current moment, create ping objects.
@@ -547,6 +585,8 @@ sub report_and_failover {
 		# renew lease before expiration (an hour early for a 24-hr lease
 		# or a minute early for a one hour lease).
 		system ($DHCPLEASECTL, $INTERFACES[$idx]);
+		# Sleep for 10 seconds.
+		sleep 10;
 		# See if gateway changed.
 		my ($new_interface_ip, $new_netmask, $new_gateway_ip, $new_lease_time, $new_units) =
 		    &get_dhcplease_info ($INTERFACES[$idx]);
@@ -588,6 +628,11 @@ sub report_and_failover {
 		# a default route (for a backup dhcplease interface), but
 		# if we're going to start using it that will be fixed below.
 		system ($BIN_SH, '/etc/netstart', "/etc/hostname.$INTERFACES[$current_gateway]");
+		# The above doesn't seem to generally work, but if there are
+		# specific routes to add, let's do that.
+		if (defined ($ROUTES[$idx])) {
+		    &add_routes ($ROUTES[$idx], $gateway_ip);
+		}
 	    }
 	    else {
 		&logmsg ('alert', "$gate_type_name $idx ($GATEWAYS[$idx]) has gone down (up $duration minute$plural).");
@@ -738,6 +783,17 @@ sub gate_index {
 
     return $idx if ($found);
     return -1;
+}
+
+# Subroutine to add routes. IPv4 only
+sub add_routes {
+    my ($routes, $gateway_ip) = @_;
+    my (@route_array, $route);
+
+    @route_array = split (/,/, $routes);
+    foreach $route (@route_array) {
+	system ($ROUTE, '-n', 'add', '-inet', $route, $gateway_ip);
+    }
 }
 
 # Log a message to syslog.
