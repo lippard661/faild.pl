@@ -20,7 +20,8 @@
 # # Then as many of these triplets as you want:
 # gateway: <ip>
 # interface: <interface name> [optional, but needed for dhcplease]
-# routes: <cidr>, <cidr>, <cidr> [optional only for dhcplease]
+# routes: <cidr>, <cidr>, <cidr> [optional only for dhcplease, use "P" after
+#    cidr for permanent route that should not be removed if gateway goes down
 # ping_ip: <ip>
 # type: <dedicated|dedicated-dhcplease-primary|dedicated-dhcplease-backup|on-demand|host>
 
@@ -174,6 +175,7 @@ if ($#ARGV == 0) {
 if ($^O eq "openbsd") {
     pledge ('rpath', 'wpath', 'cpath', 'unveil', 'proc', 'exec', 'inet', 'unix') || die "Cannot pledge promises. $!\n";
     unveil ($FAILD_CONF, 'r');
+    unveil ('/etc', 'r');
     unveil ('/etc/protocols', 'r');
     unveil ('/var/run', 'rwc');
     unveil ('/dev/log', 'rw');
@@ -418,6 +420,9 @@ sub valid_routes {
 	if (!defined ($ipaddr) || !&is_ipaddr ($ipaddr)) {
 	    return 0;
 	}
+	if ($mask =~ /^(\d+)P$/) { # permanent route
+	    $mask = $1;
+	}
 	if ($mask !~ /^\d+$/ || $mask < 1 || $mask > 32) {
 	    return 0;
 	}
@@ -632,6 +637,10 @@ sub report_and_failover {
 		# specific routes to add, let's do that.
 		if (defined ($ROUTES[$idx])) {
 		    &add_routes ($ROUTES[$idx], $gateway_ip);
+		    my $message = "Added routes for $gate_type_name $idx.";
+		    &logmsg ('alert', $message);
+		    print "$message\n" if ($DEBUG);
+		    &send_page ("faild.pl: $message");
 		}
 	    }
 	    else {
@@ -650,6 +659,15 @@ sub report_and_failover {
 	    print "$gate_type_name $idx ($GATEWAYS[$idx]) has been down for $duration minute$plural.\n" if ($DEBUG);
 	    if ($duration % 15 == 0 && $duration < 61) {
 		&send_page ("faild.pl: $gate_type_name $idx ($GATEWAYS[$idx]) has been down for $duration minutes.");
+	    }
+	    # Delete specific routes for outage of more than five minutes if
+	    # defined.
+	    if ($duration == 5 && defined ($ROUTES[$idx])) {
+		my $message = "Deleting routes for $gate_type_name $idx after five minutes of outage.";
+		&logmsg ('alert', $message);
+		print "$message\n" if ($DEBUG);
+		&send_page ("faild.pl: $message");
+		&delete_routes ($ROUTES[$idx]);
 	    }
 	}
     }
@@ -711,15 +729,20 @@ sub report_and_failover {
 		if ($PERFORM_FAILOVER && ($GATE_TYPE[$idx] == $DEDICATED ||
 					  $GATE_TYPE[$idx] == $DEDICATED_DHCPLEASE_PRIMARY ||
 					  $GATE_TYPE[$idx] == $DEDICATED_DHCPLEASE_BACKUP)) {
+
 		    # Change default route.  (Might need to add if there isn't one.)
 		    system ($ROUTE, '-n', 'change', 'default', $GATEWAYS[$idx]);
 		    system ($ROUTE, '-n', 'add', 'default', $GATEWAYS[$idx]);
 		    
-		    # Flush routes from prior gateway.
-		    system ($ROUTE, 'flush', '-iface', $INTERFACES[$prior_gateway]);
+		    # Flush routes from prior gateway unless it has specific routes defined.
+		    if (defined ($ROUTES[$prior_gateway])) {
+			&delete_routes ($ROUTES[$prior_gateway]);
+		    }
+		    else {
+			system ($ROUTE, 'flush', '-iface', $INTERFACES[$prior_gateway]);
+		    }
 		    # Flush pf states for prior gateway.
 		    system ($PFCTL, '-F', 'states', '-k', $GATEWAYS[$prior_gateway]);
-
 		}
 		elsif ($PERFORM_FAILOVER) {
 		    # Bring up on-demand dialup PPP gateway.
@@ -792,7 +815,20 @@ sub add_routes {
 
     @route_array = split (/,/, $routes);
     foreach $route (@route_array) {
+	$route =~ s/P$//; # remove P for permanent routes
 	system ($ROUTE, '-n', 'add', '-inet', $route, $gateway_ip);
+    }
+}
+
+# Subroutine to delete routes. IPv4 only
+sub delete_routes {
+    my ($routes) = @_;
+    my (@route_array, $route);
+
+    @route_array = split (/,/, $routes);
+    foreach $route (@route_array) {
+	next if $route =~ /P$/; # do not remove permanent routes
+	system ($ROUTE, '-n', 'delete', '-inet', $route);
     }
 }
 
