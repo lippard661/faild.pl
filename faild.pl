@@ -642,6 +642,11 @@ sub report_and_failover {
 		    print "$message\n" if ($DEBUG);
 		    &send_page ("faild.pl: $message");
 		}
+		# We want to delete default route if it's a backup, unless we
+		# need it.
+		if ($idx != $current_gateway && $GATE_TYPE[$idx] == $DEDICATED_DHCPLEASE_BACKUP) {
+		    system ($ROUTE, '-n', 'delete', 'default', $gateway_ip);
+		}
 	    }
 	    else {
 		&logmsg ('alert', "$gate_type_name $idx ($GATEWAYS[$idx]) has gone down (up $duration minute$plural).");
