@@ -72,6 +72,9 @@
 #      Add dedicated-dhcplease-(primary/backup) types and renew leases before they expire.
 #      Use pledge and unveil.
 # 1.11 3 July 2025: Modified to allow adding specific routes to a gateway.
+# 1.12 23 August 2025: While an interface is down, check for permanent routes
+#      and re-add them if missing, which sometimes occurs after a reboot,
+#      e.g., after power failure.
 
 ### Required packages.
 
@@ -85,7 +88,7 @@ use if $^O eq "openbsd", "OpenBSD::Unveil";
 ### Constants.
 
 # Probably shouldn't touch.
-my $VERSION = 'faild.pl 1.11 of 3 July 2025';
+my $VERSION = 'faild.pl 1.12 of 23 August 2025';
 
 my $DEDICATED = 1;
 my $DEDICATED_DHCPLEASE_PRIMARY = 2;
@@ -665,6 +668,11 @@ sub report_and_failover {
 	    if ($duration % 15 == 0 && $duration < 61) {
 		&send_page ("faild.pl: $gate_type_name $idx ($GATEWAYS[$idx]) has been down for $duration minutes.");
 	    }
+	    # Add permanent routes if missing while down -- necessary to make
+	    # sure test pings still go out the right interface.
+	    if (defined ($ROUTES[$idx])) {
+		&add_missing_perm_routes ($ROUTES[$idx], $GATEWAYS[$idx]);
+	    }
 	    # Delete specific routes for outage of more than five minutes if
 	    # defined.
 	    if ($duration == 5 && defined ($ROUTES[$idx])) {
@@ -835,6 +843,52 @@ sub delete_routes {
 	next if $route =~ /P$/; # do not remove permanent routes
 	system ($ROUTE, '-n', 'delete', '-inet', $route);
     }
+}
+
+# Subroutine to add permanent routes if missing. IPv4 only
+sub add_missing_perm_routes {
+    my ($routes, $gateway_ip) = @_;
+    my (@route_array, $route);
+
+    @route_array = split (/,/, $routes);
+    foreach $route (@route_array) {
+	next if $route !~ /P$/; # ignore non-permanent routes
+	$route =~ s/P$//; # remove P for permanent routes
+	if (!&route_present ($route, $gateway_ip)) {
+	    system ($ROUTE, '-n', 'add', '-inet', $route, $gateway_ip);
+	    my $message = "Added missing permanent route $route for $gateway_ip.";
+	    &logmsg ('alert', $message);
+	    print "$message\n" if ($DEBUG);
+	    &send_page ("faild.pl: $message");
+	}
+    }
+}
+
+# Subroutine to identify if a route is present with a given gateway.
+sub route_present {
+    my ($route, $gateway_ip) = @_;
+    my ($route_result, $route_minus_cidr, $dest_result, $gateway_result);
+
+    open (ROUTE, '-|', "$ROUTE -n get $route");
+    # could also check interface, flags (for up/down)
+    while (<ROUTE>) {
+	if (/destination: (\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/) {
+	    $dest_result = $1;
+	}
+	elsif (/gateway: (\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/) {
+	    $gateway_result = $1;
+	}
+    }
+    close (ROUTE);
+
+    $route_minus_cidr = $route;
+    $route_minus_cidr =~ s/\/\d+$//;
+
+    # is it necessary to delete the route if it's pointing to the wrong
+    # gateway?
+    return 1 if ($dest_result eq $route_minus_cidr &&
+		 $gateway_result eq $gateway_ip);
+    return 0;
 }
 
 # Log a message to syslog.
