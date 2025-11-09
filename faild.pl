@@ -75,10 +75,12 @@
 # 1.12 23 August 2025: While an interface is down, check for permanent routes
 #      and re-add them if missing, which sometimes occurs after a reboot,
 #      e.g., after power failure.
+# 1.13 8 November 2025: Modified for some cleanup.
 
 ### Required packages.
 
 use strict;
+use warnings;
 use Net::Ping;
 use Sys::Syslog;
 
@@ -88,7 +90,7 @@ use if $^O eq "openbsd", "OpenBSD::Unveil";
 ### Constants.
 
 # Probably shouldn't touch.
-my $VERSION = 'faild.pl 1.12 of 23 August 2025';
+my $VERSION = 'faild.pl 1.13 of 8 November 2025';
 
 my $DEDICATED = 1;
 my $DEDICATED_DHCPLEASE_PRIMARY = 2;
@@ -284,7 +286,15 @@ die "Config file does not exist. $! $FAILD_CONF\n" if (!-e $FAILD_CONF);
 		die "Already have an interface for gateway. $_\n";
 	    }
 	    $INTERFACES[$gateway_idx] = $1;
-	    unveil ("/etc/hostname.$1", 'r') if ($^O eq "openbsd");
+	    die "Invalid interface name. $INTERFACES[$gateway_idx]\n" unless ($INTERFACES[$gateway_idx] =~ /^[\w\._]+$/ &&
+		length ($INTERFACES[$gateway_idx]) < 16);
+	    if ($^O eq 'openbsd') {
+		unveil ("/etc/hostname.$1", 'r');
+		die "No /etc/hostname.$INTERFACES[$gateway_idx].\n" if (!-e "/etc/hostname.$1");
+	    }
+	    elsif ($^O eq 'linux') {
+		die "No /sys/class/net/$INTERFACES[$gateway_idx]\n" if (!-e "/sys/class/net/$INTERFACES[$gateway_idx]");
+	    }
 	    $have_interface = 1;
 	}
 	# Optional, only for dedicated-dhcplease types.
@@ -554,7 +564,10 @@ sub get_dhcplease_info {
 
     print "Entering sub get_dhcplease_info.\n" if ($DEBUG);
 
-    $dhcpleaseinfo = `$DHCPLEASECTL -l $interface`;
+    open (DHCPLEASE, '-|', $DHCPLEASECTL, '-l', $interface);
+    local $/;
+    $dhcpleaseinfo = <DHCPLEASE>;
+    close (DHCPLEASE);
     if ($dhcpleaseinfo =~ /inet (\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}) netmask (\d+\.\d+\.\d+\.\d+).*default gateway (\d+\.\d+\.\d+\.\d+).*lease (\d+) (hours|minutes)/s) {
 	$interface_ip = $1;
 	$netmask = $2;
@@ -601,7 +614,7 @@ sub report_and_failover {
 		if ($new_interface_ip ne $interface_ip || $new_netmask ne $netmask ||
 		    $new_gateway_ip ne $gateway_ip) {
 		    # Flush states for old gateway ip.
-		    system ("$PFCTL -F states -k $gateway_ip");
+		    system ($PFCTL, '-F', 'states', '-k', $gateway_ip);
 		    my $message = "New DHCP lease for $gate_type_name $idx: interface IP $interface_ip netmask $netmask gateway $gateway_ip->$new_interface_ip $new_netmask gateway $new_gateway_ip.";
 		    &logmsg ('alert', $message);
 		    print "$message\n" if ($DEBUG);
