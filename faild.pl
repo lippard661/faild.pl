@@ -289,8 +289,8 @@ die "Config file does not exist. $! $FAILD_CONF\n" if (!-e $FAILD_CONF);
 	    die "Invalid interface name. $INTERFACES[$gateway_idx]\n" unless ($INTERFACES[$gateway_idx] =~ /^[\w\._]+$/ &&
 		length ($INTERFACES[$gateway_idx]) < 16);
 	    if ($^O eq 'openbsd') {
-		unveil ("/etc/hostname.$1", 'r');
-		die "No /etc/hostname.$INTERFACES[$gateway_idx].\n" if (!-e "/etc/hostname.$1");
+		unveil ("/etc/hostname.$INTERFACES[$gateway_idx]", 'r');
+		die "No /etc/hostname.$INTERFACES[$gateway_idx].\n" if (!-e "/etc/hostname.$INTERFACES[$gateway_idx]");
 	    }
 	    elsif ($^O eq 'linux') {
 		die "No /sys/class/net/$INTERFACES[$gateway_idx]\n" if (!-e "/sys/class/net/$INTERFACES[$gateway_idx]");
