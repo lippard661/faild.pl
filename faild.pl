@@ -76,6 +76,7 @@
 #      and re-add them if missing, which sometimes occurs after a reboot,
 #      e.g., after power failure.
 # 1.13 8 November 2025: Modified for some cleanup.
+# 1.14 4 January 2026: Modified to remove & from subroutine calls.
 
 ### Required packages.
 
@@ -194,22 +195,22 @@ if ($^O eq "openbsd") {
     # don't lock yet.
 }
 
-&parse_config;
+parse_config();
 unveil () if ($^O eq "openbsd"); # done unveiling after config is parsed
-&initialize_states;
+initialize_states();
 Sys::Syslog::setlogsock('unix');
-&read_faild_info;
+read_faild_info();
 
 # Infinite loop.
 while (1) {
-    &ping_gateways;
-    &report_and_failover;
+    ping_gateways();
+    report_and_failover();
 
     print "Sleeping for $SLEEP_TIME seconds.\n" if ($DEBUG);
     sleep $SLEEP_TIME;
 }
 
-&logmsg ('alert', 'Process has exited from infinite loop.');
+logmsg ('alert', 'Process has exited from infinite loop.');
 exit;
 
 ### Subroutines.
@@ -233,7 +234,7 @@ die "Config file does not exist. $! $FAILD_CONF\n" if (!-e $FAILD_CONF);
 	    # comment or blank
 	}
 	elsif (/^\s*page_source:\s*(.*)$/) {
-	    if (&is_email ($1)) {
+	    if (is_email ($1)) {
 		$PAGE_SOURCE = $1;
 		$have_page_source = 1;
 	    }
@@ -242,7 +243,7 @@ die "Config file does not exist. $! $FAILD_CONF\n" if (!-e $FAILD_CONF);
 	    }
 	}
 	elsif (/^\s*page_destination:\s*(.*)$/) {
-	    if (&is_email ($1)) {
+	    if (is_email ($1)) {
 		$PAGE_DESTINATION = $1;
 		$have_page_destination = 1;
 	    }
@@ -268,7 +269,7 @@ die "Config file does not exist. $! $FAILD_CONF\n" if (!-e $FAILD_CONF);
 		die "New gateway line when no interface specified for previous dedicated-dhcplease gateway. $_\n" if (!$have_interface && ($GATE_TYPE[$gateway_idx] == $DEDICATED_DHCPLEASE_PRIMARY ||
 																	   $GATE_TYPE[$gateway_idx] == $DEDICATED_DHCPLEASE_BACKUP));
 	    }
-	    if (&is_ipaddr ($1)) {
+	    if (is_ipaddr ($1)) {
 		push (@GATEWAYS, $1);
 		$gateway_idx++;
 		$have_interface = 0;
@@ -305,7 +306,7 @@ die "Config file does not exist. $! $FAILD_CONF\n" if (!-e $FAILD_CONF);
 	    $ROUTES[$gateway_idx] = $1;
 	    # remove any whitespace
 	    $ROUTES[$gateway_idx] =~ s/\s//g;
-	    if (!&valid_routes ($ROUTES[$gateway_idx])) {
+	    if (!valid_routes ($ROUTES[$gateway_idx])) {
 		die "Invalid specific routes. $ROUTES[$gateway_idx]\n";
 	    }
 	    $have_routes = 1;
@@ -314,7 +315,7 @@ die "Config file does not exist. $! $FAILD_CONF\n" if (!-e $FAILD_CONF);
 	    if ($have_ping_ip) {
 		die "Already have a ping IP for gateway. $_\n";
 	    }
-	    if (&is_ipaddr ($1)) {
+	    if (is_ipaddr ($1)) {
 		push (@PING_IPS, $1);
 		$have_ping_ip = 1;
 	    }
@@ -392,10 +393,10 @@ sub is_ipaddr {
     my ($ipaddr) = @_;
 
     if ($ipaddr =~ /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/) {
-	if (&is_octet ($1) &&
-	    &is_octet ($2) &&
-	    &is_octet ($3) &&
-	    &is_octet ($4) &&
+	if (is_octet ($1) &&
+	    is_octet ($2) &&
+	    is_octet ($3) &&
+	    is_octet ($4) &&
 	    $1 > 0) {
 	    return 1;
 	}
@@ -430,7 +431,7 @@ sub valid_routes {
     @route_array = split (/,/, $routes);
     foreach $route (@route_array) {
 	($ipaddr, $mask) = split (/\//, $route);
-	if (!defined ($ipaddr) || !&is_ipaddr ($ipaddr)) {
+	if (!defined ($ipaddr) || !is_ipaddr ($ipaddr)) {
 	    return 0;
 	}
 	if ($mask =~ /^(\d+)P$/) { # permanent route
@@ -448,13 +449,13 @@ sub initialize_states {
     my ($ip, $idx);
 
     print "Entering sub initialize_states.\n" if ($DEBUG);
-    $ip = &gateway_ip;
-    $current_gateway = &gate_index ($ip);
+    $ip = gateway_ip;
+    $current_gateway = gate_index ($ip);
     print "Current gateway is $current_gateway ($ip).\n" if ($DEBUG);
 
     if ($current_gateway == -1) {
-	&logmsg ('alert', "Current gateway ($ip) is not in faild.pl configuration.");
-	&send_page ("faild.pl: Current gateway ($ip) is not in faild.pl configuration.");
+	logmsg ('alert', "Current gateway ($ip) is not in faild.pl configuration.");
+	send_page ("faild.pl: Current gateway ($ip) is not in faild.pl configuration.");
     }
 
     for ($idx = 0; $idx <= $#GATEWAYS; $idx++) {
@@ -469,7 +470,7 @@ sub initialize_states {
 	close (PID);
     }
 
-    &logmsg ("info", "started");
+    logmsg ("info", "started");
 }
 
 sub read_faild_info {
@@ -485,7 +486,7 @@ sub read_faild_info {
 	    chop;
 	    $gateway_count++;
 	    ($ip, $state, $state_time) = split (/,\s+/);
-	    $idx = &gate_index ($ip);
+	    $idx = gate_index ($ip);
 	    if ($idx >= 0) {
 		$current_state[$idx] = $state;
 		$state_time[$idx] = $state_time;
@@ -544,12 +545,12 @@ sub ping_gateways {
 		if ($ping_obj[$idx] -> ping ($PING_IPS[$idx])) {
 		    $new_state[$idx] = $UP;
 		    print "$gate_type_name $idx ($GATEWAYS[$idx]) is up on the $PING_NAME{$n_pings} ping.\n" if ($DEBUG);
-		    &logmsg ('alert', "$gate_type_name $idx ($GATEWAYS[$idx]) is up on the $PING_NAME{$n_pings} ping.") if ($n_pings > $N_PINGS_TO_NOTIFY);
+		    logmsg ('alert', "$gate_type_name $idx ($GATEWAYS[$idx]) is up on the $PING_NAME{$n_pings} ping.") if ($n_pings > $N_PINGS_TO_NOTIFY);
 		    last;
 		}
 		else {
 		    print "$gate_type_name $idx ($GATEWAYS[$idx]) is down on the $PING_NAME{$n_pings} ping.\n" if ($DEBUG);
-		    &logmsg ('alert', "$gate_type_name $idx ($GATEWAYS[$idx]) is down on the $PING_NAME{$n_pings} ping.") if ($n_pings > $N_PINGS_TO_NOTIFY);
+		    logmsg ('alert', "$gate_type_name $idx ($GATEWAYS[$idx]) is down on the $PING_NAME{$n_pings} ping.") if ($n_pings > $N_PINGS_TO_NOTIFY);
 		    $pings_down[$idx] = $n_pings;
 		}
 	    }
@@ -601,7 +602,7 @@ sub report_and_failover {
 	    && defined ($INTERFACES[$idx])
 	    && $new_state[$idx] == $UP) {
 	    ($interface_ip, $netmask, $gateway_ip, $lease_time, $units) =
-		&get_dhcplease_info ($INTERFACES[$idx]);
+		get_dhcplease_info ($INTERFACES[$idx]);
 	    if ($lease_time == 1) {
 		# renew lease before expiration (an hour early for a 24-hr lease
 		# or a minute early for a one hour lease).
@@ -610,15 +611,15 @@ sub report_and_failover {
 		sleep 10;
 		# See if gateway changed.
 		my ($new_interface_ip, $new_netmask, $new_gateway_ip, $new_lease_time, $new_units) =
-		    &get_dhcplease_info ($INTERFACES[$idx]);
+		    get_dhcplease_info ($INTERFACES[$idx]);
 		if ($new_interface_ip ne $interface_ip || $new_netmask ne $netmask ||
 		    $new_gateway_ip ne $gateway_ip) {
 		    # Flush states for old gateway ip.
 		    system ($PFCTL, '-F', 'states', '-k', $gateway_ip);
 		    my $message = "New DHCP lease for $gate_type_name $idx: interface IP $interface_ip netmask $netmask gateway $gateway_ip->$new_interface_ip $new_netmask gateway $new_gateway_ip.";
-		    &logmsg ('alert', $message);
+		    logmsg ('alert', $message);
 		    print "$message\n" if ($DEBUG);
-		    &send_page ("faild.pl: $message");
+		    send_page ("faild.pl: $message");
 		    $gateway_ip = $new_gateway_ip;
 		}
 		# remove default route if this is a backup that is not the current
@@ -637,10 +638,10 @@ sub report_and_failover {
 	    $plural = 's';
 	    $plural = '' if ($duration == 1);
 	    if ($new_state[$idx] == $UP) {
-		&logmsg ('alert', "$gate_type_name $idx ($GATEWAYS[$idx]) is again reachable (down $duration minute$plural), $pings_down[$idx] failed pings.");
+		logmsg ('alert', "$gate_type_name $idx ($GATEWAYS[$idx]) is again reachable (down $duration minute$plural), $pings_down[$idx] failed pings.");
 		print "$gate_type_name $idx ($GATEWAYS[$idx]) is again reachable (down $duration minute$plural).\n" if ($DEBUG);
 		if ($duration > 15) {
-		    &send_page ("faild.pl: $gate_type_name $idx ($GATEWAYS[$idx]) is again reachable (down $duration minute$plural).");
+		    send_page ("faild.pl: $gate_type_name $idx ($GATEWAYS[$idx]) is again reachable (down $duration minute$plural).");
 		}
 		# A newly up gateway that we may or may not be switching to,
 		# depending on whether multiple were down.  We may end up
@@ -652,11 +653,11 @@ sub report_and_failover {
 		# The above doesn't seem to generally work, but if there are
 		# specific routes to add, let's do that.
 		if (defined ($ROUTES[$idx])) {
-		    &add_routes ($ROUTES[$idx], $gateway_ip);
+		    add_routes ($ROUTES[$idx], $gateway_ip);
 		    my $message = "Added routes for $gate_type_name $idx.";
-		    &logmsg ('alert', $message);
+		    logmsg ('alert', $message);
 		    print "$message\n" if ($DEBUG);
-		    &send_page ("faild.pl: $message");
+		    send_page ("faild.pl: $message");
 		}
 		# We want to delete default route if it's a backup, unless we
 		# need it.
@@ -665,7 +666,7 @@ sub report_and_failover {
 		}
 	    }
 	    else {
-		&logmsg ('alert', "$gate_type_name $idx ($GATEWAYS[$idx]) has gone down (up $duration minute$plural).");
+		logmsg ('alert', "$gate_type_name $idx ($GATEWAYS[$idx]) has gone down (up $duration minute$plural).");
 		print "$gate_type_name $idx ($GATEWAYS[$idx]) has gone down (up $duration minute$plural).\n" if ($DEBUG);
 	    }
 	    $current_state[$idx] = $new_state[$idx];
@@ -676,24 +677,24 @@ sub report_and_failover {
 	    $duration = int ($duration / 60);
 	    $plural = 's';
 	    $plural = '' if ($duration == 1);
-	    &logmsg ('alert', "$gate_type_name $idx ($GATEWAYS[$idx]) has been down for $duration minute$plural.");
+	    logmsg ('alert', "$gate_type_name $idx ($GATEWAYS[$idx]) has been down for $duration minute$plural.");
 	    print "$gate_type_name $idx ($GATEWAYS[$idx]) has been down for $duration minute$plural.\n" if ($DEBUG);
 	    if ($duration % 15 == 0 && $duration < 61) {
-		&send_page ("faild.pl: $gate_type_name $idx ($GATEWAYS[$idx]) has been down for $duration minutes.");
+		send_page ("faild.pl: $gate_type_name $idx ($GATEWAYS[$idx]) has been down for $duration minutes.");
 	    }
 	    # Add permanent routes if missing while down -- necessary to make
 	    # sure test pings still go out the right interface.
 	    if (defined ($ROUTES[$idx])) {
-		&add_missing_perm_routes ($ROUTES[$idx], $GATEWAYS[$idx]);
+		add_missing_perm_routes ($ROUTES[$idx], $GATEWAYS[$idx]);
 	    }
 	    # Delete specific routes for outage of more than five minutes if
 	    # defined.
 	    if ($duration == 5 && defined ($ROUTES[$idx])) {
 		my $message = "Deleting routes for $gate_type_name $idx after five minutes of outage.";
-		&logmsg ('alert', $message);
+		logmsg ('alert', $message);
 		print "$message\n" if ($DEBUG);
-		&send_page ("faild.pl: $message");
-		&delete_routes ($ROUTES[$idx]);
+		send_page ("faild.pl: $message");
+		delete_routes ($ROUTES[$idx]);
 	    }
 	}
     }
@@ -702,7 +703,7 @@ sub report_and_failover {
     # or if there are some new gateways not already recorded,
     # write out new states.
     if ($changes_occurred || !-e $FAILD_INFO || $more_gateways_than_recorded) {
-	&write_faild_info;
+	write_faild_info;
     }
 
     # If current gateway is down, look for one to failover to.
@@ -725,27 +726,27 @@ sub report_and_failover {
 	    # doing it.
 	    elsif ($new_state[$idx] == $UP && $GATE_TYPE[$idx] != $HOST_CHECK) {
 		if ($idx < $current_gateway) {
-		    &logmsg ('alert', "Failing back from gateway $current_gateway ($GATEWAYS[$current_gateway]) to gateway $idx ($GATEWAYS[$idx]).");
+		    logmsg ('alert', "Failing back from gateway $current_gateway ($GATEWAYS[$current_gateway]) to gateway $idx ($GATEWAYS[$idx]).");
 		    print "Failing back from gateway $current_gateway ($GATEWAYS[$current_gateway]) to gateway $idx ($GATEWAYS[$idx]).\n" if ($DEBUG);
-		    &send_page ("faild.pl: Failing back from gateway $current_gateway ($GATEWAYS[$current_gateway]) to gateway $idx ($GATEWAYS[$idx]).");
+		    send_page ("faild.pl: Failing back from gateway $current_gateway ($GATEWAYS[$current_gateway]) to gateway $idx ($GATEWAYS[$idx]).");
 		    $current_gateway = $idx;
 		}
 		elsif ($idx > $current_gateway) {
 		    if ($current_gateway == -1) {
-			&logmsg ('alert', "Starting up with gateway $idx ($GATEWAYS[$idx]).");
+			logmsg ('alert', "Starting up with gateway $idx ($GATEWAYS[$idx]).");
 			print "Starting up with gateway $idx ($GATEWAYS[$idx]).\n";
 		    }
 		    else {
-			&logmsg ('alert', "Failing over from gateway $current_gateway ($GATEWAYS[$current_gateway]) to gateway $idx ($GATEWAYS[$idx]).");
+			logmsg ('alert', "Failing over from gateway $current_gateway ($GATEWAYS[$current_gateway]) to gateway $idx ($GATEWAYS[$idx]).");
 			print "Failing over from gateway $current_gateway ($GATEWAYS[$current_gateway]) to gateway $idx ($GATEWAYS[$idx]).\n" if ($DEBUG);
-			&send_page ("faild.pl: Failing over from gateway $current_gateway ($GATEWAYS[$current_gateway]) to gateway $idx ($GATEWAYS[$idx]).");
+			send_page ("faild.pl: Failing over from gateway $current_gateway ($GATEWAYS[$current_gateway]) to gateway $idx ($GATEWAYS[$idx]).");
 		    }
 		    $current_gateway = $idx;
 		}
 		else {
-		    &logmsg ('alert', "Primary and current gateway $current_gateway ($GATEWAYS[$current_gateway]) is back up.");
+		    logmsg ('alert', "Primary and current gateway $current_gateway ($GATEWAYS[$current_gateway]) is back up.");
 		    print "Primary and current gateway $current_gateway ($GATEWAYS[$current_gateway]) is back up.\n" if ($DEBUG);
-		    &send_page ("faild.pl: Primary and current gateway $current_gateway ($GATEWAYS[$current_gateway]) is back up.");
+		    send_page ("faild.pl: Primary and current gateway $current_gateway ($GATEWAYS[$current_gateway]) is back up.");
 		}
 
 		# We found something to switch to.
@@ -762,7 +763,7 @@ sub report_and_failover {
 		    
 		    # Flush routes from prior gateway unless it has specific routes defined.
 		    if (defined ($ROUTES[$prior_gateway])) {
-			&delete_routes ($ROUTES[$prior_gateway]);
+			delete_routes ($ROUTES[$prior_gateway]);
 		    }
 		    else {
 			system ($ROUTE, 'flush', '-iface', $INTERFACES[$prior_gateway]);
@@ -799,7 +800,7 @@ sub report_and_failover {
     if ($#GATEWAYS > 0 &&
 	!$changes_occurred &&
 	$new_state[$current_gateway] == $DOWN) {
-	&logmsg ('alert', "All available gateways are down.");
+	logmsg ('alert', "All available gateways are down.");
 	print "All available gateways are down.\n" if ($DEBUG);
     }
 }
@@ -867,12 +868,12 @@ sub add_missing_perm_routes {
     foreach $route (@route_array) {
 	next if $route !~ /P$/; # ignore non-permanent routes
 	$route =~ s/P$//; # remove P for permanent routes
-	if (!&route_present ($route, $gateway_ip)) {
+	if (!route_present ($route, $gateway_ip)) {
 	    system ($ROUTE, '-n', 'add', '-inet', $route, $gateway_ip);
 	    my $message = "Added missing permanent route $route for $gateway_ip.";
-	    &logmsg ('alert', $message);
+	    logmsg ('alert', $message);
 	    print "$message\n" if ($DEBUG);
-	    &send_page ("faild.pl: $message");
+	    send_page ("faild.pl: $message");
 	}
     }
 }
