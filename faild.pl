@@ -920,7 +920,7 @@ sub send_page {
     my ($msg) = @_;
 
     print "Sending page.\n" if ($DEBUG);
-    open (MAIL, '|-', "$SENDMAIL -t");
+    open (MAIL, '|-', $SENDMAIL, '-t');
     print MAIL "From: $PAGE_SOURCE\n";
     print MAIL "To: $PAGE_DESTINATION\n\n";
     print MAIL "$msg\n";
