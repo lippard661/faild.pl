@@ -449,7 +449,7 @@ sub initialize_states {
     my ($ip, $idx);
 
     print "Entering sub initialize_states.\n" if ($DEBUG);
-    $ip = gateway_ip;
+    $ip = gateway_ip();
     $current_gateway = gate_index ($ip);
     print "Current gateway is $current_gateway ($ip).\n" if ($DEBUG);
 
