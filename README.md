@@ -1,5 +1,5 @@
 # faild.pl
-Script to monitor Internet connections and remote hosts for uptime and generate alerts when they go down.
+Script to monitor Internet connections and remote hosts for uptime and generate alerts when they go down. Also can make routing changes to facilitate failover.
 
 Also found at https://www.discord.org/lippard/software/
 
