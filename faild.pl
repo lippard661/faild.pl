@@ -77,6 +77,9 @@
 #      e.g., after power failure.
 # 1.13 8 November 2025: Modified for some cleanup.
 # 1.14 4 January 2026: Modified to remove & from subroutine calls.
+# 1.15 1 March 2026: Modified (with Claude assistance at identifying issues
+#      based on my description) to fix failover delay bug and some other
+#      minor issues.
 
 ### Required packages.
 
@@ -697,6 +700,7 @@ sub report_and_failover {
 		delete_routes ($ROUTES[$idx]);
 	    }
 	}
+	$state_time[$idx] = time();
     }
 
     # If changes occurred or states haven't been written out before,
@@ -706,13 +710,20 @@ sub report_and_failover {
 	write_faild_info;
     }
 
+    # Calculate how long the current gateway has been down.
+    $duration = 0;
+    if ($new_state[$current_gateway] == $DOWN && defined($state_time[$current_gateway])) {
+	$duration = (time() - $state_time[$current_gateway]) / 60;  # minutes
+    }
+
     # If current gateway is down, look for one to failover to.
     # If current gateway is not the primary, look for a higher-priority
     # gateway to fail back to.
     $changes_occurred = 0;
     $prior_gateway = $current_gateway;
+
     if (($new_state[$current_gateway] == $DOWN &&
-	 $duration >= $FAILOVER_DELAY_MINUTES) || $current_gateway != 0) {
+	 $duration >= $FAILOVER_DELAY_MINUTES)) {
 	for ($idx = 0; $idx <= $#GATEWAYS; $idx++) {
 	    $gate_type_name = $GATE_TYPE_NAME[$GATE_TYPE[$idx]];
 	    # If we're trying to fail back, give up when we get to the
