@@ -80,6 +80,9 @@
 # 1.15 1 March 2026: Modified (with Claude assistance at identifying issues
 #      based on my description) to fix failover delay bug and some other
 #      minor issues.
+# 1.16 17 March 2026: Modified to fix bug in host monitoring downtime duration
+#      tracking and bug where "All available gateways are down" when a monitored
+#      host (not gateway) is down.
 
 ### Required packages.
 
@@ -700,7 +703,6 @@ sub report_and_failover {
 		delete_routes ($ROUTES[$idx]);
 	    }
 	}
-	$state_time[$idx] = time();
     }
 
     # If changes occurred or states haven't been written out before,
@@ -811,8 +813,18 @@ sub report_and_failover {
     if ($#GATEWAYS > 0 &&
 	!$changes_occurred &&
 	$new_state[$current_gateway] == $DOWN) {
-	logmsg ('alert', "All available gateways are down.");
-	print "All available gateways are down.\n" if ($DEBUG);
+	# Check if there are actually any UP gateways (excluding HOST_CHECK)
+	my $any_gateway_up = 0;
+	for (my $idx = 0; $idx <= $#GATEWAYS; $idx++) {
+	    if ($new_state[$idx] == $UP && $GATE_TYPE[$idx] != $HOST_CHECK) {
+		$any_gateway_up = 1;
+		last;
+	    }
+	}
+	if (!$any_gateway_up) {
+	    logmsg ('alert', "All available gateways are down.");
+	    print "All available gatewaeys are down.\n" if ($DEBUG);
+	}
     }
 }
 
