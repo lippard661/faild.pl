@@ -86,6 +86,7 @@
 # 1.17 3 May 2026: Modified to avoid shell in opening pipes for commands. Umask
 #      for file permissions. Flock for PID file, eliminate race condition.
 #      Better error checking and reporting.
+# 1.18 5 May 2026: Modified to fix bug in failback.
 
 ### Required packages.
 
@@ -100,7 +101,7 @@ use if $^O eq "openbsd", "OpenBSD::Unveil";
 
 ### Constants.
 
-my $VERSION = 'faild.pl 1.17 of 3 May 2026';
+my $VERSION = 'faild.pl 1.18 of 5 May 2026';
 
 my $DEDICATED = 1;
 my $DEDICATED_DHCPLEASE_PRIMARY = 2;
@@ -641,7 +642,7 @@ sub get_dhcplease_info {
 # Subroutine to report any state changes and failover to another
 # gateway if necessary and possible.
 sub report_and_failover {
-    my ($changes_occurred, $idx, $duration, $plural);
+    my ($changes_occurred, $duration, $plural);
     my ($interface_ip, $netmask, $gateway_ip, $lease_time, $units);
     my ($prior_gateway);
 
@@ -649,7 +650,7 @@ sub report_and_failover {
 
     # Report changes that have occurred.
     $changes_occurred = 0;
-    for ($idx = 0; $idx <= $#GATEWAYS; $idx++) {
+    for (my $idx = 0; $idx <= $#GATEWAYS; $idx++) {
 	$gate_type_name = $GATE_TYPE_NAME[$GATE_TYPE[$idx]];
 
 	# Check for expiring leases and renew to try to prevent fake outages.
@@ -780,9 +781,19 @@ sub report_and_failover {
     $changes_occurred = 0;
     $prior_gateway = $current_gateway;
 
+    # Determine if failback is possible (a higher-priority gateway is up)
+    my $failback_possible = 0;
+    for (my $idx = 0; $idx < $current_gateway; $idx++) {
+	if ($new_state[$idx] == $UP && $GATE_TYPE[$idx] != $HOST_CHECK) {
+	    $failback_possible = 1;
+	    last;
+	}
+    }
+
     if (($new_state[$current_gateway] == $DOWN &&
-	 $duration >= $FAILOVER_DELAY_MINUTES)) {
-	for ($idx = 0; $idx <= $#GATEWAYS; $idx++) {
+	 $duration >= $FAILOVER_DELAY_MINUTES) ||
+	$failback_possible) {
+	for (my $idx = 0; $idx <= $#GATEWAYS; $idx++) {
 	    $gate_type_name = $GATE_TYPE_NAME[$GATE_TYPE[$idx]];
 	    # If we're trying to fail back, give up when we get to the
 	    # current gateway--no higher-priority gateway is up.
