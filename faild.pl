@@ -87,8 +87,10 @@
 #      for file permissions. Flock for PID file, eliminate race condition.
 #      Better error checking and reporting.
 # 1.18 5 May 2026: Modified to fix bug in failback.
-# 1.19 14 May 2024: Replace Net::Ping with use of OS ping command as part
-#      of preparation for privilege separation, properly daemonize.
+# 1.19 14 May 2026: Replace Net::Ping with use of OS ping command as part
+#      of preparation for privilege separation, properly daemonize. Remove
+#      netstart call and unveil for /bin/sh to do it. Improve forced lease
+#      renewing.
 
 ### Required packages.
 
@@ -162,7 +164,6 @@ my $FAILD_CONF = '/etc/faild.conf';
 my $FAILD_INFO = '/var/run/faild.info';
 my $FAILD_PID = '/var/run/faild.pid';
 
-my $BIN_SH = '/bin/sh';
 my $DHCPLEASECTL = '/usr/sbin/dhcpleasectl';
 my $IFCONFIG = '/usr/sbin/ifconfig';
 my $PFCTL = '/sbin/pfctl';
@@ -178,8 +179,9 @@ my ($PAGE_SOURCE, $PAGE_DESTINATION);
 
 ### Variables.
 
-my ($current_gateway, @ping_obj, @current_state, @new_state, @state_time, @pings_down, $n_pings);
+my ($current_gateway, @current_state, @new_state, @state_time, @pings_down, $n_pings);
 my ($gate_type_name, $more_gateways_than_recorded);
+my (@last_interface_ip, @last_netmask, @last_gateway_ip);
 
 ### Main program.
 
@@ -204,7 +206,6 @@ if ($^O eq "openbsd") {
     unveil ('/var/run', 'rwc');
     unveil ('/dev/log', 'rw');
     unveil ('/dev/null', 'rw');
-    unveil ($BIN_SH, 'x');
     unveil ($DHCPLEASECTL, 'x');
     unveil ($IFCONFIG, 'x');
     unveil ($PFCTL, 'x');
@@ -515,6 +516,28 @@ sub initialize_states {
 	$pings_down[$idx] = 0;
     }
 
+    # For DHCP gateways, verify the configured gateway IP matches what
+    # dhcpleased reports. If not (e.g., IP changed since config was last
+    # updated), use the current dhcpleased value.
+    for ($idx = 0; $idx <= $#GATEWAYS; $idx++) {
+	if (($GATE_TYPE[$idx] == $DEDICATED_DHCPLEASE_PRIMARY ||
+	     $GATE_TYPE[$idx] == $DEDICATED_DHCPLEASE_BACKUP) &&
+	    defined ($INTERFACES[$idx])) {
+	    my (undef, undef, $dhcp_gateway, undef, undef) =
+		get_dhcplease_info ($INTERFACES[$idx]);
+	    if (defined ($dhcp_gateway) && $dhcp_gateway ne $GATEWAYS[$idx]) {
+		my $message = "Startup: configured gateway $GATEWAYS[$idx] for " .
+		    "interface $INTERFACES[$idx] doesn't match dhcpleased's " .
+		    "$dhcp_gateway; using dhcpleased value.";
+		logmsg ('alert', $message);
+		print "$message\n" if ($DEBUG);
+		# Update ping_ip too if it matched the old gateway
+		$PING_IPS[$idx] = $dhcp_gateway if ($PING_IPS[$idx] eq $GATEWAYS[$idx]);
+		$GATEWAYS[$idx] = $dhcp_gateway;
+	    }
+	}
+    }
+
     logmsg ("info", "started");
 }
 
@@ -692,41 +715,88 @@ sub report_and_failover {
     for (my $idx = 0; $idx <= $#GATEWAYS; $idx++) {
 	$gate_type_name = $GATE_TYPE_NAME[$GATE_TYPE[$idx]];
 
-	# Check for expiring leases and renew to try to prevent fake outages.
+	# Check DHCP lease info for changes and expiring leases.
 	if (($GATE_TYPE[$idx] == $DEDICATED_DHCPLEASE_PRIMARY
 	     || $GATE_TYPE[$idx] == $DEDICATED_DHCPLEASE_BACKUP)
 	    && defined ($INTERFACES[$idx])
 	    && $new_state[$idx] == $UP) {
 	    ($interface_ip, $netmask, $gateway_ip, $lease_time, $units) =
 		get_dhcplease_info ($INTERFACES[$idx]);
-	    if (defined ($lease_time) && $lease_time == 1) {
-		# renew lease before expiration (an hour early for a 24-hr lease
-		# or a minute early for a one hour lease).
-		run_cmd ("renew DHCP lease on $INTERFACES[$idx]", 1,
-			 $DHCPLEASECTL, $INTERFACES[$idx]);
-		# Sleep for 10 seconds.
-		sleep 10;
-		# See if gateway changed.
-		my ($new_interface_ip, $new_netmask, $new_gateway_ip, $new_lease_time, $new_units) =
-		    get_dhcplease_info ($INTERFACES[$idx]);
-		if ($new_interface_ip ne $interface_ip || $new_netmask ne $netmask ||
-		    $new_gateway_ip ne $gateway_ip) {
-		    # Flush states for old gateway ip.
-		    run_cmd ("flush pf states for $gateway_ip", 1,
-			     $PFCTL, '-F', 'states', '-k', $gateway_ip);
-		    my $message = "New DHCP lease for $gate_type_name $idx: interface IP $interface_ip netmask $netmask gateway $gateway_ip->$new_interface_ip $new_netmask gateway $new_gateway_ip.";
+
+	    # Renew lease first if expiration is imminent (safety net for stuck dhcpleased).
+	    if (defined ($lease_time) && defined ($units)) {
+		my $minutes_remaining;
+		if ($units eq 'hours') {
+		    $minutes_remaining = $lease_time * 60;
+		}
+		elsif ($units eq 'minutes') {
+		    $minutes_remaining = $lease_time;
+		}
+		if (defined ($minutes_remaining) && $minutes_remaining <= 5) {
+		    run_cmd ("renew DHCP lease on $INTERFACES[$idx]", 1,
+			     $DHCPLEASECTL, $INTERFACES[$idx]);
+		    # Give dhcpleased time to process the renewal and update its info.
+		    sleep 10;
+		    # Re-fetch lease info after renewal.
+		    ($interface_ip, $netmask, $gateway_ip, $lease_time, $units) =
+			get_dhcplease_info ($INTERFACES[$idx]);
+		}
+	    }
+
+	    # Check for IP/gateway changes (catches changes from dhcpleased's
+	    # automatic renewals as well as our forced renewal above).
+	    if (defined ($interface_ip) && defined ($gateway_ip)) {
+		if (defined ($last_interface_ip[$idx]) && 
+		    ($interface_ip ne $last_interface_ip[$idx] ||
+		     $netmask ne $last_netmask[$idx] ||
+		     $gateway_ip ne $last_gateway_ip[$idx])) {
+		    # Flush states for old gateway IP.
+		    run_cmd ("flush pf states for $last_gateway_ip[$idx]", 1,
+			     $PFCTL, '-F', 'states', '-k', $last_gateway_ip[$idx]);
+		    # If this is a backup gateway not currently in use, also delete
+		    # the stale default route for the old IP (dhcpleased may have
+		    # added a new one for the new IP, and we don't want both lingering).
+		    if ($idx != $current_gateway && 
+			$GATE_TYPE[$idx] == $DEDICATED_DHCPLEASE_BACKUP) {
+			run_cmd ("delete stale default route for old IP $last_gateway_ip[$idx]", 0,
+				 $ROUTE, '-n', 'delete', 'default', $last_gateway_ip[$idx]);
+		    }
+		    # If this gateway is currently in use, the default route needs to
+		    # be updated to point to the new gateway IP.
+		    elsif ($idx == $current_gateway) {
+			run_cmd ("change default route to new IP $gateway_ip", 1,
+				 $ROUTE, '-n', 'change', 'default', $gateway_ip);
+		    }
+		    # Also update the stored GATEWAYS and PING_IPS if they match the old IP.
+		    # This handles the case where the config specifies the dhcp-assigned IP
+		    # itself as the ping target.
+		    if ($GATEWAYS[$idx] eq $last_gateway_ip[$idx]) {
+			$GATEWAYS[$idx] = $gateway_ip;
+		    }
+		    if ($PING_IPS[$idx] eq $last_gateway_ip[$idx]) {
+			$PING_IPS[$idx] = $gateway_ip;
+		    }
+		    my $message = "DHCP lease changed for $gate_type_name $idx: " .
+			"interface IP $last_interface_ip[$idx]->$interface_ip, " .
+			"netmask $last_netmask[$idx]->$netmask, " .
+			"gateway $last_gateway_ip[$idx]->$gateway_ip.";
 		    logmsg ('alert', $message);
 		    print "$message\n" if ($DEBUG);
 		    send_page ("faild.pl: $message");
-		    $gateway_ip = $new_gateway_ip;
 		}
-		# remove default route if this is a backup that is not the current
-		# gateway -- dhcpleased will have added it (assuming multipath routing).
-		if ($idx != $current_gateway && $GATE_TYPE[$idx] == $DEDICATED_DHCPLEASE_BACKUP) {
-		    run_cmd ("delete default route for $gateway_ip", 0,
-			     $ROUTE, '-n', 'delete', 'default', $gateway_ip);
-		    # Maybe also run /bin/sh /etc/netstart /etc/hostname.interface?  No, only do during state change to UP.
-		}
+		# Update tracked values.
+		$last_interface_ip[$idx] = $interface_ip;
+		$last_netmask[$idx] = $netmask;
+		$last_gateway_ip[$idx] = $gateway_ip;
+	    }
+
+	    # Remove default route if this is a backup that is not the current
+	    # gateway -- dhcpleased may have added it (assuming multipath routing).
+	    if (defined ($gateway_ip) &&
+		$idx != $current_gateway && 
+		$GATE_TYPE[$idx] == $DEDICATED_DHCPLEASE_BACKUP) {
+		run_cmd ("delete default route for $gateway_ip", 0,
+			 $ROUTE, '-n', 'delete', 'default', $gateway_ip);
 	    }
 	}
 
@@ -746,13 +816,7 @@ sub report_and_failover {
 		# A newly up gateway that we may or may not be switching to,
 		# depending on whether multiple were down.  We may end up
 		# using it, which is handled further below.
-		# Run netstart on interface. This might delete
-		# a default route (for a backup dhcplease interface), but
-		# if we're going to start using it that will be fixed below.
-		run_cmd ("netstart for $INTERFACES[$current_gateway]", 1,
-			 $BIN_SH, '/etc/netstart', "/etc/hostname.$INTERFACES[$current_gateway]");
-		# The above doesn't seem to generally work, but if there are
-		# specific routes to add, let's do that.
+		# If there are specific routes to add, let's do that.
 		if (defined ($ROUTES[$idx])) {
 		    add_routes ($ROUTES[$idx], $gateway_ip);
 		    my $message = "Added routes for $gate_type_name $idx.";
