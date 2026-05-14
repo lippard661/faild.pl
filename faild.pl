@@ -7,10 +7,6 @@
 # the local network (these may be the same, e.g., for a cable modem setup, or
 # distinct, for a T1 with a local router as the gateway), and its type
 # (dedicated or on-demand).
-
-# Current implementation only allows one ppp-on-demand gateway since
-# there is only a single option for PPP_SYSTEM and PPP_IF, though this
-# could be added to a per-gateway array like other options.
 #
 # Config file /etc/faild.conf format:
 # # Comment format
@@ -35,15 +31,6 @@
 #    checking dhcpleasectl info on gateways, making additional
 #    routing changes, error checking. (DONE, sort of)
 # 3. IPv6 support. (currently using tunnel on one interface)
-# 4. PPP on-demand needs completion to handle failback/modem hangup,
-#    possible NAT. (Not using this anymore, so unlikely to happen.)
-# 5. Need to do an ifconfig $PPP_IF down/ifconfig $PPP_IF delete at
-#    failback.
-
-# Alternative:
-# ppp -auto.  When failover occurs, just change the default route,
-#   send some traffic (to where?), and sleep for $PPP_WAIT_TIME
-#   seconds, then check for IP assignments to tun0.
 
 # 2003-04-29 by Jim Lippard, from original written 2002-04-12.
 # 1.1: 6 May 2003
@@ -90,7 +77,7 @@
 # 1.19 14 May 2026: Replace Net::Ping with use of OS ping command as part
 #      of preparation for privilege separation, properly daemonize. Remove
 #      netstart call and unveil for /bin/sh to do it. Improve forced lease
-#      renewing.
+#      renewing. Remove PPP support.
 
 ### Required packages.
 
@@ -110,13 +97,11 @@ my $VERSION = 'faild.pl 1.19 of 14 May 2026';
 my $DEDICATED = 1;
 my $DEDICATED_DHCPLEASE_PRIMARY = 2;
 my $DEDICATED_DHCPLEASE_BACKUP = 3;
-my $ON_DEMAND = 4;
-my $HOST_CHECK = 5;
+my $HOST_CHECK = 4;
 my @GATE_TYPE_NAME = ('',
 		      'Gateway',
 		      'Gateway (DHCP primary)',
 		      'Gateway (DHCP backup)',
-		      'On-demand gateway',
 		      'Host');
 
 my $UP = 1;
@@ -132,8 +117,6 @@ my $FAILOVER_DELAY_MINUTES = 2;
 
 # Number of seconds to wait between gateway checks.
 my $SLEEP_TIME = 60;
-# Number of seconds to wait for on-demand PPP connections.
-my $PPP_WAIT_TIME = 15;
 # Number of times to ping gateways before counting them as genuinely down.
 my $N_PINGS_DOWN = 5;
 # Number of times to ping before logging individual ping failures.
@@ -154,22 +137,14 @@ my %PING_NAME = (1, 'first',
 
 my (@GATEWAYS, @INTERFACES, @ROUTES, @PING_IPS, @GATE_TYPE);
 
-# Name of PPP system to use in /etc/ppp/ppp.conf.
-my $PPP_SYSTEM = 'pmdemand';
-# Name of interface PPP connection is over (tun0 for ppp,
-# would be ppp0 for pppd).
-my $PPP_IF = 'tun0';
-
 my $FAILD_CONF = '/etc/faild.conf';
 my $FAILD_INFO = '/var/run/faild.info';
 my $FAILD_PID = '/var/run/faild.pid';
 
 my $DHCPLEASECTL = '/usr/sbin/dhcpleasectl';
-my $IFCONFIG = '/usr/sbin/ifconfig';
 my $PFCTL = '/sbin/pfctl';
 my $PING = '/sbin/ping';
 $PING = '/usr/bin/ping' if ($^O eq 'linux'); # Linux not supported for routing
-my $PPP = '/usr/sbin/ppp';
 my $ROUTE = '/sbin/route';
 my $SENDMAIL = '/usr/sbin/sendmail';
 
@@ -207,10 +182,8 @@ if ($^O eq "openbsd") {
     unveil ('/dev/log', 'rw');
     unveil ('/dev/null', 'rw');
     unveil ($DHCPLEASECTL, 'x');
-    unveil ($IFCONFIG, 'x');
     unveil ($PFCTL, 'x');
     unveil ($PING, 'x');
-    unveil ($PPP, 'x');
     unveil ($ROUTE, 'x');
     unveil ($SENDMAIL, 'x');
     # don't lock yet.
@@ -361,9 +334,6 @@ sub parse_config {
 	    }
 	    elsif ($1 eq 'dedicated-dhcplease-backup') {
 		push (@GATE_TYPE, $DEDICATED_DHCPLEASE_BACKUP);
-	    }
-	    elsif ($1 eq 'on-demand') {
-		push (@GATE_TYPE, $ON_DEMAND);
 	    }
 	    elsif ($1 eq 'host') {
 		push (@GATE_TYPE, $HOST_CHECK);
@@ -943,28 +913,6 @@ sub report_and_failover {
 			     $PFCTL, '-F', 'states', '-k', $GATEWAYS[$prior_gateway]);
 		    
 		}
-		elsif ($PERFORM_FAILOVER) {
-		    # Bring up on-demand dialup PPP gateway.
-		    run_cmd ("start PPP system $PPP_SYSTEM", 1,
-			     $PPP, '-ddial', $PPP_SYSTEM);
-		    sleep $PPP_WAIT_TIME;
-
-		    if (open (IFCONF, '-|', $IFCONFIG, $PPP_IF)) {
-			while (<IFCONF>) {
-			    if (/inet (\d+\.\d+\.\d+\.\d+) --> (\d+\.\d+\.\d+\.\d+)/) {
-				# ADD: check to make sure we get something,
-				#  record my IP, so we can send it out.
-				$GATEWAYS[$idx] = $2;
-				$PING_IPS[$idx] = $2;
-			    }
-			} # while
-			close (IFCONF);
-		    } #ifconfig
-		    # Routing change for on-demand gateway.
-		    run_cmd ("change default route to $GATEWAYS[$idx] for on-demand", 1,
-			     $ROUTE, 'change', 'default', $GATEWAYS[$idx]);
-		} # dialup PPP
-		# ADD: Change pf config/NAT.  No, should be in place already.
 		last;
 	    } # found up gateway
 	} # for loop
