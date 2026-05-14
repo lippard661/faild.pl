@@ -87,13 +87,15 @@
 #      for file permissions. Flock for PID file, eliminate race condition.
 #      Better error checking and reporting.
 # 1.18 5 May 2026: Modified to fix bug in failback.
+# 1.19 14 May 2024: Replace Net::Ping with use of OS ping command as part
+#      of preparation for privilege separation, properly daemonize.
 
 ### Required packages.
 
 use strict;
 use warnings;
 use Fcntl qw( :flock );
-use Net::Ping;
+use POSIX;
 use Sys::Syslog;
 
 use if $^O eq "openbsd", "OpenBSD::Pledge";
@@ -101,7 +103,7 @@ use if $^O eq "openbsd", "OpenBSD::Unveil";
 
 ### Constants.
 
-my $VERSION = 'faild.pl 1.18 of 5 May 2026';
+my $VERSION = 'faild.pl 1.19 of 14 May 2026';
 
 my $DEDICATED = 1;
 my $DEDICATED_DHCPLEASE_PRIMARY = 2;
@@ -134,6 +136,8 @@ my $PPP_WAIT_TIME = 15;
 my $N_PINGS_DOWN = 5;
 # Number of times to ping before logging individual ping failures.
 my $N_PINGS_TO_NOTIFY = 3;
+# Number of seconds to wait for each ping to succeed or fail.
+my $PING_TIMEOUT = 1;
 
 my %PING_NAME = (1, 'first',
 		 2, 'second',
@@ -162,6 +166,8 @@ my $BIN_SH = '/bin/sh';
 my $DHCPLEASECTL = '/usr/sbin/dhcpleasectl';
 my $IFCONFIG = '/usr/sbin/ifconfig';
 my $PFCTL = '/sbin/pfctl';
+my $PING = '/sbin/ping';
+$PING = '/usr/bin/ping' if ($^O eq 'linux'); # Linux not supported for routing
 my $PPP = '/usr/sbin/ppp';
 my $ROUTE = '/sbin/route';
 my $SENDMAIL = '/usr/sbin/sendmail';
@@ -191,27 +197,34 @@ umask 022; # rw-r-r-
 
 # Pledge, Unveil.
 if ($^O eq "openbsd") {
-    pledge ('rpath', 'wpath', 'cpath', 'unveil', 'proc', 'exec', 'inet', 'unix', 'flock') || die "Cannot pledge promises. $!\n";
+    pledge ('rpath', 'wpath', 'cpath', 'unveil', 'proc', 'exec', 'unix', 'flock') || die "Cannot pledge promises. $!\n";
     unveil ($FAILD_CONF, 'r');
     unveil ('/etc', 'r');
     unveil ('/etc/protocols', 'r');
     unveil ('/var/run', 'rwc');
     unveil ('/dev/log', 'rw');
-    unveil ($BIN_SH, 'rx');
-    unveil ($DHCPLEASECTL, 'rx');
-    unveil ($IFCONFIG, 'rx');
-    unveil ($PFCTL, 'rx');
-    unveil ($PPP, 'rx');
-    unveil ($ROUTE, 'rx');
-    unveil ($SENDMAIL, 'rx');
+    unveil ('/dev/null', 'rw');
+    unveil ($BIN_SH, 'x');
+    unveil ($DHCPLEASECTL, 'x');
+    unveil ($IFCONFIG, 'x');
+    unveil ($PFCTL, 'x');
+    unveil ($PING, 'x');
+    unveil ($PPP, 'x');
+    unveil ($ROUTE, 'x');
+    unveil ($SENDMAIL, 'x');
     # don't lock yet.
 }
 
 parse_config();
+acquire_pid_lock();
 unveil () if ($^O eq "openbsd"); # done unveiling after config is parsed
 initialize_states();
 Sys::Syslog::setlogsock('unix');
 read_faild_info();
+
+daemonize() unless ($DEBUG);
+
+write_pid();
 
 # Infinite loop.
 while (1) {
@@ -497,26 +510,52 @@ sub initialize_states {
     }
 
     for ($idx = 0; $idx <= $#GATEWAYS; $idx++) {
-	$ping_obj[$idx] = Net::Ping -> new("icmp", 5);
 	$current_state[$idx] = $UP;
 	$state_time[$idx] = time();
 	$pings_down[$idx] = 0;
     }
 
-    # Acquire exclusive lock on PID file to prevent multiple instances.
-    # The lock is automatically released when the process exits.
+    logmsg ("info", "started");
+}
+
+sub acquire_pid_lock {
+    # Open and lock the PID file. Must be called before daemonize().
     open (PID, '+>>', $FAILD_PID) || die "Cannot open PID file. $! $FAILD_PID\n";
-    if (!flock (PID, LOCK_EX | LOCK_NB)) {
-	die "Another instance of faild.pl is already running.\n";
+    if (!flock (PID, 2 | 4)) {  # LOCK_EX | LOCK_NB
+        die "Another instance of faild.pl is already running.\n";
     }
-    # Truncate and write our PID
+}
+
+
+# Daemonize: detach from controlling terminal and redirect standard fds
+sub daemonize {
+    # Fork; parent exits
+    my $pid = fork();
+    die "Cannot fork: $!\n" if (!defined $pid);
+    exit (0) if ($pid != 0);  # parent exits
+    
+    # Child: become session leader
+    POSIX::setsid() || die "Cannot setsid: $!\n";
+    
+    # Redirect standard file descriptors to /dev/null
+    open (my $devnull, '+<', '/dev/null') || die "Cannot open /dev/null: $!\n";
+    POSIX::dup2 (fileno($devnull), 0);
+    POSIX::dup2 (fileno($devnull), 1);
+    POSIX::dup2 (fileno($devnull), 2);
+    close ($devnull);
+    
+    # Optionally chdir to / to avoid holding the cwd
+    chdir ('/');
+}
+
+sub write_pid {
+    # Write our PID to the already-locked file. Must be called after daemonize()
+    # so that the child's PID (not the parent's) is recorded.
     seek (PID, 0, 0);
     truncate (PID, 0);
     print PID "$$\n";
     PID->flush() if PID->can('flush');
-    # Do NOT close PID - keeping it open maintains the lock
-
-    logmsg ("info", "started");
+    # Do NOT close PID - keeping it open maintains the flock
 }
 
 sub read_faild_info {
@@ -579,7 +618,7 @@ sub ping_gateways {
 	    $new_state[$idx] = $UP;
 	    print "$gate_type_name $idx ($GATEWAYS[$idx]) assumed to be up.\n" if ($DEBUG);
 	}
-	elsif ($ping_obj[$idx] -> ping ($PING_IPS[$idx])) {
+	elsif (ping_host ($PING_IPS[$idx], $PING_TIMEOUT)) {
 	    $new_state[$idx] = $UP;
 	    print "$gate_type_name $idx ($GATEWAYS[$idx]) is up on the first ping.\n" if ($DEBUG);
 	}
@@ -596,7 +635,7 @@ sub ping_gateways {
 	$gate_type_name = $GATE_TYPE_NAME[$GATE_TYPE[$idx]];
 	if ($new_state[$idx] == $DOWN) {
 	    for ($n_pings = 2; $n_pings < $N_PINGS_DOWN+1; $n_pings++) {
-		if ($ping_obj[$idx] -> ping ($PING_IPS[$idx])) {
+		if (ping_host ($PING_IPS[$idx], $PING_TIMEOUT)) {
 		    $new_state[$idx] = $UP;
 		    print "$gate_type_name $idx ($GATEWAYS[$idx]) is up on the $PING_NAME{$n_pings} ping.\n" if ($DEBUG);
 		    logmsg ('alert', "$gate_type_name $idx ($GATEWAYS[$idx]) is up on the $PING_NAME{$n_pings} ping.") if ($n_pings > $N_PINGS_TO_NOTIFY);
@@ -1040,4 +1079,34 @@ sub send_page {
     print MAIL "To: $PAGE_DESTINATION\n\n";
     print MAIL "$msg\n";
     close (MAIL);
+}
+
+# Ping gateways or hosts.
+# Send a single ICMP ping using /sbin/ping. Returns 1 on success, 0 on failure.
+# This replaces Net::Ping which requires raw sockets (root privileges).
+sub ping_host {
+    my ($ip, $timeout) = @_;
+    $timeout //= 1;
+    
+    # Validate IP before passing to system command (defense in depth)
+    return 0 unless ($ip =~ /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/);
+    
+    my $pid = fork();
+    if (!defined $pid) {
+        logmsg ('alert', "fork failed for ping: $!");
+        return 0;
+    }
+    if ($pid == 0) {
+        # Child: redirect stdout/stderr to /dev/null and exec ping
+        open (my $devnull, '+<', '/dev/null') or exit (1);
+        POSIX::dup2 (fileno($devnull), 0);
+        POSIX::dup2 (fileno($devnull), 1);
+        POSIX::dup2 (fileno($devnull), 2);	
+	close ($devnull);
+        exec ($PING, '-c', '1', '-w', $timeout, '-q', $ip);
+        exit (1);  # only reached if exec fails
+    }
+    # Parent: wait for ping to complete
+    waitpid ($pid, 0);
+    return ($? == 0) ? 1 : 0;
 }
