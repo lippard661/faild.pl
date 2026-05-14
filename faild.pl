@@ -584,7 +584,7 @@ sub ping_gateways {
 
     for ($idx = 0; $idx <= $#GATEWAYS; $idx++) {
 	$gate_type_name = $GATE_TYPE_NAME[$GATE_TYPE[$idx]];
-	sif (ping_host ($PING_IPS[$idx], $PING_TIMEOUT)) {
+	if (ping_host ($PING_IPS[$idx], $PING_TIMEOUT)) {
 	    $new_state[$idx] = $UP;
 	    print "$gate_type_name $idx ($GATEWAYS[$idx]) is up on the first ping.\n" if ($DEBUG);
 	}
