@@ -584,13 +584,7 @@ sub ping_gateways {
 
     for ($idx = 0; $idx <= $#GATEWAYS; $idx++) {
 	$gate_type_name = $GATE_TYPE_NAME[$GATE_TYPE[$idx]];
-	if ($GATE_TYPE[$idx] == $ON_DEMAND &&
-	    $current_gateway != $idx &&
-	    $current_state[$idx] == $UP) {
-	    $new_state[$idx] = $UP;
-	    print "$gate_type_name $idx ($GATEWAYS[$idx]) assumed to be up.\n" if ($DEBUG);
-	}
-	elsif (ping_host ($PING_IPS[$idx], $PING_TIMEOUT)) {
+	sif (ping_host ($PING_IPS[$idx], $PING_TIMEOUT)) {
 	    $new_state[$idx] = $UP;
 	    print "$gate_type_name $idx ($GATEWAYS[$idx]) is up on the first ping.\n" if ($DEBUG);
 	}
