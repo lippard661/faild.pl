@@ -546,7 +546,8 @@ sub daemonize {
     close ($devnull);
     
     # Optionally chdir to / to avoid holding the cwd
-    chdir ('/');
+    # If you do this, you must unveil /.
+    # chdir ('/');
 }
 
 sub write_pid {
