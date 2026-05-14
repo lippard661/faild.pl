@@ -496,7 +496,7 @@ sub run_cmd {
     return 1;
 }
 
-# Initialize states with up, since current moment, create ping objects.
+# Initialize states with up, since current moment.
 sub initialize_states {
     my ($ip, $idx);
 
@@ -514,28 +514,6 @@ sub initialize_states {
 	$current_state[$idx] = $UP;
 	$state_time[$idx] = time();
 	$pings_down[$idx] = 0;
-    }
-
-    # For DHCP gateways, verify the configured gateway IP matches what
-    # dhcpleased reports. If not (e.g., IP changed since config was last
-    # updated), use the current dhcpleased value.
-    for ($idx = 0; $idx <= $#GATEWAYS; $idx++) {
-	if (($GATE_TYPE[$idx] == $DEDICATED_DHCPLEASE_PRIMARY ||
-	     $GATE_TYPE[$idx] == $DEDICATED_DHCPLEASE_BACKUP) &&
-	    defined ($INTERFACES[$idx])) {
-	    my (undef, undef, $dhcp_gateway, undef, undef) =
-		get_dhcplease_info ($INTERFACES[$idx]);
-	    if (defined ($dhcp_gateway) && $dhcp_gateway ne $GATEWAYS[$idx]) {
-		my $message = "Startup: configured gateway $GATEWAYS[$idx] for " .
-		    "interface $INTERFACES[$idx] doesn't match dhcpleased's " .
-		    "$dhcp_gateway; using dhcpleased value.";
-		logmsg ('alert', $message);
-		print "$message\n" if ($DEBUG);
-		# Update ping_ip too if it matched the old gateway
-		$PING_IPS[$idx] = $dhcp_gateway if ($PING_IPS[$idx] eq $GATEWAYS[$idx]);
-		$GATEWAYS[$idx] = $dhcp_gateway;
-	    }
-	}
     }
 
     logmsg ("info", "started");
