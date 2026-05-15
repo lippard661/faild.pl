@@ -739,7 +739,7 @@ sub helper_request {
     print $helper_sock encode_json(\%args) . "\n";
     my $line = <$helper_sock>;
     if (!defined $line) {
-        logmsg('alert', 'Helper communication failed: no response');
+        logmsg('alert', 'Helper communication failed: no response, exiting.');
         die "Lost connection to privileged helper, exiting.\n";
     }
     chomp $line;
