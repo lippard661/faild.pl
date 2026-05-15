@@ -78,13 +78,26 @@
 #      of preparation for privilege separation, properly daemonize. Remove
 #      netstart call and unveil for /bin/sh to do it. Improve forced lease
 #      renewing. Remove PPP support.
+# 1.20 15 May 2026: Added privilege separation, state_dir: for config file,
+#      can run as nonpriv user, in monitor-only mode with no priv process,
+#      will drop privs and restrict pledges.
+
+# ToDo: Some former "constants" are now variables from the config and should
+# consider moving them to the variables section and making them all
+# lowercase names.
 
 ### Required packages.
 
 use strict;
 use warnings;
+use base; # required by Privileges::Drop;
+use English; # required by Privileges::Drop;
 use Fcntl qw( :flock );
+use IO::Handle;
+use JSON::PP;
 use POSIX;
+use Privileges::Drop;
+use Socket qw( AF_UNIX SOCK_STREAM PF_UNSPEC );
 use Sys::Syslog;
 
 use if $^O eq "openbsd", "OpenBSD::Pledge";
@@ -92,7 +105,23 @@ use if $^O eq "openbsd", "OpenBSD::Unveil";
 
 ### Constants.
 
-my $VERSION = 'faild.pl 1.19 of 14 May 2026';
+my $VERSION = 'faild.pl 1.20 of 15 May 2026';
+
+# Pledge promise groups - stdio is added automatically by OpenBSD::Pledge
+my @READONLY_PROMISES     = ('rpath');
+my @READWRITE_PROMISES    = ('wpath', 'cpath');
+my @EXEC_PROMISES         = ('proc', 'exec');
+my @FLOCK_PROMISE         = ('flock');
+my @UNVEIL_PROMISE        = ('unveil');
+my @UNIX_PROMISE          = ('unix');
+my @PRIVSEP_DROP_PROMISES = ('id', 'prot_exec');
+my @CHOWN_PROMISES        = ('chown', 'fattr');
+
+my @RUNTIME_PROMISES = (@READONLY_PROMISES, @READWRITE_PROMISES,
+                        @EXEC_PROMISES, @FLOCK_PROMISE, @UNIX_PROMISE);
+my @HELPER_PROMISES = (@EXEC_PROMISES);
+my @STARTUP_PROMISES = (@RUNTIME_PROMISES, @UNVEIL_PROMISE, @PRIVSEP_DROP_PROMISES,
+    @CHOWN_PROMISES);
 
 my $DEDICATED = 1;
 my $DEDICATED_DHCPLEASE_PRIMARY = 2;
@@ -138,8 +167,9 @@ my %PING_NAME = (1, 'first',
 my (@GATEWAYS, @INTERFACES, @ROUTES, @PING_IPS, @GATE_TYPE);
 
 my $FAILD_CONF = '/etc/faild.conf';
-my $FAILD_INFO = '/var/run/faild.info';
-my $FAILD_PID = '/var/run/faild.pid';
+my $STATE_DIR = '/var/run';; # default
+my $FAILD_INFO; # default = '/var/run/faild.info';
+my $FAILD_PID; # default = '/var/run/faild.pid';
 
 my $DHCPLEASECTL = '/usr/sbin/dhcpleasectl';
 my $PFCTL = '/sbin/pfctl';
@@ -157,6 +187,9 @@ my ($PAGE_SOURCE, $PAGE_DESTINATION);
 my ($current_gateway, @current_state, @new_state, @state_time, @pings_down, $n_pings);
 my ($gate_type_name, $more_gateways_than_recorded);
 my (@last_interface_ip, @last_netmask, @last_gateway_ip);
+my ($faild_uid, $faild_gid);
+my $helper_sock; # for privilege separation
+
 
 ### Main program.
 
@@ -174,10 +207,9 @@ umask 022; # rw-r-r-
 
 # Pledge, Unveil.
 if ($^O eq "openbsd") {
-    pledge ('rpath', 'wpath', 'cpath', 'unveil', 'proc', 'exec', 'unix', 'flock') || die "Cannot pledge promises. $!\n";
+    pledge (@STARTUP_PROMISES) || die "Cannot pledge promises. $!\n";
     unveil ($FAILD_CONF, 'r');
     unveil ('/etc', 'r');
-    unveil ('/etc/protocols', 'r');
     unveil ('/var/run', 'rwc');
     unveil ('/dev/log', 'rw');
     unveil ('/dev/null', 'rw');
@@ -190,13 +222,57 @@ if ($^O eq "openbsd") {
 }
 
 parse_config();
+$FAILD_INFO = "$STATE_DIR/faild.info";
+$FAILD_PID = "$STATE_DIR/faild.pid";
+if ($^O eq 'openbsd') {
+    unveil ($STATE_DIR, 'rwc');
+    unveil (); # done unveiling, lock it
+}
+
+my ($running_as_root, $need_helper) = determine_privilege_mode();
+
+# Check that state_dir is writable for the eventual runtime user
+# (root always can; non-root must be writable as the current user)
+if (!$running_as_root) {
+    if (!-w $STATE_DIR) {
+        die "Cannot use state_dir '$STATE_DIR' - not writable by current user.\n" .
+            "Set state_dir in $FAILD_CONF to a directory writable by your user, " .
+            "e.g., '/tmp' or '\$HOME/.faild'.\n";
+    }
+}
+# When running as root, the directory will be made accessible to _faild
+# in setup_privsep (file chown). The /var/run default is root-writable.
+
 acquire_pid_lock();
-unveil () if ($^O eq "openbsd"); # done unveiling after config is parsed
 initialize_states();
 Sys::Syslog::setlogsock('unix');
 read_faild_info();
 
 daemonize() unless ($DEBUG);
+
+if ($need_helper) {
+    setup_privsep();
+}
+# monitor-only mode, don't need privileged helper
+elsif ($running_as_root) {
+    prepare_state_files_for_user ($faild_uid, $faild_gid);
+    Privileges::Drop::drop_uidgid ($faild_uid, $faild_gid);
+    $0 = 'faild monitor';
+}
+# already running as non-root
+else {
+    $0 = 'faild monitor';
+}
+
+# Tighten pledge.
+pledge (@RUNTIME_PROMISES) if ($^O eq 'openbsd');
+
+# Set up signal handlers in child
+$SIG{TERM} = sub {
+    logmsg('info', 'Received SIGTERM, exiting cleanly');
+    exit(0);
+};
+$SIG{INT} = $SIG{TERM};
 
 write_pid();
 
@@ -231,6 +307,13 @@ sub parse_config {
 	chomp;
 	if (/^\s*#|^\s*$/) {
 	    # comment or blank
+	}
+	elsif (/^\s*state_dir:\s*(.*)$/) {
+	    $STATE_DIR = $1;
+	    $STATE_DIR =~ s|/+$||; # remove any trailing slashes
+	    die "Invalid state_dir path: $STATE_DIR\n"
+		unless ($STATE_DIR =~ m{^/[\w/.-]+$} && length ($STATE_DIR) < 256);
+	    die "state_dir $STATE_DIR does not exist.\n" unless (-d $STATE_DIR);
 	}
 	elsif (/^\s*page_source:\s*(.*)$/) {
 	    if (is_email ($1)) {
@@ -289,7 +372,7 @@ sub parse_config {
 	    die "Invalid interface name. $INTERFACES[$gateway_idx]\n" unless ($INTERFACES[$gateway_idx] =~ /^[\w\._]+$/ &&
 		length ($INTERFACES[$gateway_idx]) < 16);
 	    if ($^O eq 'openbsd') {
-		unveil ("/etc/hostname.$INTERFACES[$gateway_idx]", 'r');
+		# no need to unveil specifically since /etc is unveiled with r
 		die "No /etc/hostname.$INTERFACES[$gateway_idx].\n" if (!-e "/etc/hostname.$INTERFACES[$gateway_idx]");
 	    }
 	    elsif ($^O eq 'linux') {
@@ -388,27 +471,16 @@ sub is_email {
     }
 }
 
-# Subroutine to do rudimentary IP address check.
+# Validation functions
 sub is_ipaddr {
-    my ($ipaddr) = @_;
-
-    if ($ipaddr =~ /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/) {
-	if (is_octet ($1) &&
-	    is_octet ($2) &&
-	    is_octet ($3) &&
-	    is_octet ($4) &&
-	    $1 > 0) {
-	    return 1;
-	}
-	else {
-	    # Bad octet.
-	    return 0;
-	}
+    my ($ip) = @_;
+    return 0 unless defined ($ip);
+    return 0 unless ($ip =~ /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    return 0 if ($1 == 0); # First octet must be non-zero
+    foreach my $octet ($1, $2, $3, $4) {
+        return 0 if ($octet > 255);
     }
-    else {
-	# Not even close to an IP.
-	return 0;
-    }
+    return 1;
 }
 
 # Subroutine to check numeric range of octet.
@@ -423,38 +495,278 @@ sub is_octet {
     }
 }
 
+# Subroutine to check format of CIDR block.
+sub is_cidr {
+    my ($cidr) = @_;
+    return 0 unless defined ($cidr);
+    return 0 unless ($cidr =~ m{^([\d.]+)/(\d+)$});
+    my ($ip, $bits) = ($1, $2);
+    return is_ipaddr ($ip) && $bits >= 1 && $bits <= 32;
+}
+
+# Subroutine to validate an interface.
+sub is_interface {
+    my ($if) = @_;
+    return 0 unless defined ($if);
+    return 0 unless ($if =~ /^[a-z]+\d+$/);
+    return 0 if (length ($if) >= 16);
+    return 1;
+}
+
 # Subroutine to check format of specific routes list. IPv4 only.
 sub valid_routes {
     my ($routes) = @_;
-    my (@route_array, $route, $ipaddr, $mask);
-
-    @route_array = split (/,/, $routes);
-    foreach $route (@route_array) {
-	($ipaddr, $mask) = split (/\//, $route);
-	if (!defined ($ipaddr) || !is_ipaddr ($ipaddr)) {
-	    return 0;
-	}
-	if ($mask =~ /^(\d+)P$/) { # permanent route
-	    $mask = $1;
-	}
-	if ($mask !~ /^\d+$/ || $mask < 1 || $mask > 32) {
-	    return 0;
-	}
+    my @route_array = split (/,/, $routes);
+    foreach my $route (@route_array) {
+        my $clean = $route;
+        $clean =~ s/P$//;  # strip permanent marker
+        return 0 unless is_cidr ($clean);
     }
     return 1;
 }
 
-# Subroutine to run a system command with error checking.
-# Returns 1 on success, 0 on failure.
-# $log_failure: if true, log failures via logmsg; if false, only print in DEBUG mode
-#               (useful for commands where failure may be expected, like deleting
-#                a route that may not exist).
-sub run_cmd {
-    my ($description, $log_failure, @cmd) = @_;
+### Privilege separation subroutines.
 
-    if (system (@cmd) != 0) {
-        my $exit_code = $? >> 8;
-        my $msg = "Failed: $description (exit $exit_code): $!";
+# Subroutine to determine privilege mode for this invocation.
+sub determine_privilege_mode {
+    my $running_as_root = ($> == 0);
+    
+    my $need_helper = $PERFORM_FAILOVER;
+    if (!$need_helper) {
+        for (my $i = 0; $i <= $#GATEWAYS; $i++) {
+            if ($GATE_TYPE[$i] == $DEDICATED_DHCPLEASE_PRIMARY ||
+                $GATE_TYPE[$i] == $DEDICATED_DHCPLEASE_BACKUP) {
+                $need_helper = 1;
+                last;
+            }
+        }
+    }
+
+    # Validate we have the privileges and users we need.
+    if ($need_helper && !$running_as_root) {
+        die "faild.pl needs to run as root for failover or DHCP gateway types.\n";
+    }
+
+    # If running as root, we'll drop privileges - verify _faild exists
+    if ($running_as_root) {
+        $faild_uid = getpwnam('_faild');
+        $faild_gid = getgrnam('_faild');
+        if (!defined($faild_uid) || !defined($faild_gid)) {
+            die "Cannot drop privileges: _faild user and group must exist.\n" .
+                "Create with: useradd -L daemon -d /var/empty -s /sbin/nologin _faild\n";
+        }
+    }
+    
+    return ($running_as_root, $need_helper);
+}
+
+# Subroutine to set up privilege separation.
+sub setup_privsep {
+    prepare_state_files_for_user ($faild_uid, $faild_gid);
+    
+    my ($parent_sock, $child_sock);
+    socketpair($parent_sock, $child_sock, AF_UNIX, SOCK_STREAM, PF_UNSPEC)
+        or die "socketpair: $!";
+    
+    $parent_sock->autoflush(1);
+    $child_sock->autoflush(1);
+    
+    my $pid = fork();
+    die "Cannot fork for privsep: $!\n" if (!defined $pid);
+    
+    if ($pid != 0) {
+        # Parent: become the helper
+        close($child_sock);
+        $0 = 'faild [priv]';
+
+	# Setup signal handlers.
+	$SIG{TERM} = sub { exit(0); };
+	$SIG{INT} = sub { exit(0); };
+        
+        # Helper-specific pledge - more restrictive than child
+	pledge (@HELPER_PROMISES) || die "Cannot pledge promises. $!\n" if ($^O eq 'openbsd');
+        
+        helper_loop($parent_sock);
+        
+        # When helper_loop returns, child has disconnected
+        exit(0);
+    }
+    
+    # Child: continue with privilege drop
+    close($parent_sock);
+    $helper_sock = $child_sock;
+
+    Privileges::Drop::drop_uidgid ($faild_uid, $faild_gid);
+
+    # Pledges are tightened right after this in main program, for multiple code paths,
+    # otherwise it would have been done here.
+
+    $0 = 'faild monitor';
+}
+
+## Privileged (helper) side, executes privileged operations.
+
+# Privileged listener.
+sub helper_loop {
+    my ($sock) = @_;
+    
+    while (my $line = <$sock>) {
+        chomp $line;
+        my $req;
+        eval { $req = decode_json($line); };
+        if ($@) {
+            print $sock encode_json({status => 'err', reason => 'invalid JSON'}) . "\n";
+            next;
+        }
+        my $resp = dispatch_command($req);
+        print $sock encode_json($resp) . "\n";
+    }
+}
+
+# Helper command dispatch - runs in the privileged process (or same process in Step 2)
+sub dispatch_command {
+    my ($req) = @_;
+    my $cmd = $req->{cmd} || '';
+    
+    if ($cmd eq 'ROUTE_CHANGE_DEFAULT') {
+        return {status => 'err', reason => 'bad ip'} 
+            unless (defined ($req->{ip}) && is_ipaddr ($req->{ip}));
+        return run_helper_cmd ($ROUTE, '-n', 'change', 'default', $req->{ip});
+    }
+    elsif ($cmd eq 'ROUTE_ADD_DEFAULT') {
+        return {status => 'err', reason => 'bad ip'} 
+            unless (defined ($req->{ip}) && is_ipaddr ($req->{ip}));
+        return run_helper_cmd ($ROUTE, '-n', 'add', 'default', $req->{ip});
+    }
+    elsif ($cmd eq 'ROUTE_DELETE_DEFAULT') {
+        return {status => 'err', reason => 'bad ip'} 
+            unless (defined ($req->{ip}) && is_ipaddr ($req->{ip}));
+        return run_helper_cmd ($ROUTE, '-n', 'delete', 'default', $req->{ip});
+    }
+    elsif ($cmd eq 'ROUTE_ADD') {
+        return {status => 'err', reason => 'bad cidr'} 
+            unless (defined ($req->{cidr}) && is_cidr ($req->{cidr}));
+        return {status => 'err', reason => 'bad gateway'} 
+            unless (defined ($req->{gateway}) && is_ipaddr ($req->{gateway}));
+        return run_helper_cmd ($ROUTE, '-n', 'add', '-inet', $req->{cidr}, $req->{gateway});
+    }
+    elsif ($cmd eq 'ROUTE_DELETE') {
+        return {status => 'err', reason => 'bad cidr'} 
+            unless (defined ($req->{cidr}) && is_cidr ($req->{cidr}));
+        return run_helper_cmd ($ROUTE, '-n', 'delete', '-inet', $req->{cidr});
+    }
+    elsif ($cmd eq 'ROUTE_FLUSH_IFACE') {
+        return {status => 'err', reason => 'bad interface'} 
+            unless (defined ($req->{interface}) && is_interface ($req->{interface}));
+        return run_helper_cmd ($ROUTE, 'flush', '-iface', $req->{interface});
+    }
+    elsif ($cmd eq 'PFCTL_FLUSH_STATES') {
+        return {status => 'err', reason => 'bad ip'} 
+            unless (defined ($req->{ip}) && is_ipaddr ($req->{ip}));
+        return run_helper_cmd ($PFCTL, '-F', 'states', '-k', $req->{ip});
+    }
+    elsif ($cmd eq 'DHCPLEASECTL_RENEW') {
+        return {status => 'err', reason => 'bad interface'} 
+            unless (defined ($req->{interface}) && is_interface ($req->{interface}));
+        return run_helper_cmd ($DHCPLEASECTL, $req->{interface});
+    }
+    elsif ($cmd eq 'DHCPLEASECTL_INFO') {
+        return {status => 'err', reason => 'bad interface'} 
+            unless (defined ($req->{interface}) && is_interface ($req->{interface}));
+        return get_dhcp_info ($req->{interface});
+    }
+    else {
+        return {status => 'err', reason => 'unknown command'};
+    }
+}
+
+# Run a privileged system command, return JSON-encodable result
+sub run_helper_cmd {
+    my (@cmd) = @_;
+    if (system (@cmd) == 0) {
+        return {status => 'ok'};
+    }
+    else {
+        my $exit = $? >> 8;
+        return {status => 'err', reason => "exit $exit"};
+    }
+}
+
+# Get DHCP lease info - returns structured data
+sub get_dhcp_info {
+    my ($interface) = @_;
+    my $fh;
+    if (!open ($fh, '-|', $DHCPLEASECTL, '-l', $interface)) {
+        return {status => 'err', reason => "cannot run dhcpleasectl: $!"};
+    }
+    my $output = '';
+    while (<$fh>) { $output .= $_; }
+    close ($fh);
+    
+    # Match existing parsing logic from old get_dhcplease_info
+    if ($output =~ /inet (\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}) netmask (\d+\.\d+\.\d+\.\d+).*default gateway (\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}).*lease (\d+) (hours|minutes)/s) {
+        return {
+            status => 'ok',
+            ip => $1,
+            netmask => $2,
+            gateway => $3,
+            lease_time => int($4),
+            units => $5,
+        };
+    }
+    else {
+        return {status => 'err', reason => 'cannot parse dhcpleasectl output'};
+    }
+}
+
+## Client-side subroutines (nonprivileged side, makes requests for privileged operations).
+
+# Subroutine to send a request.
+sub helper_request {
+    my (%args) = @_;
+    
+    if (!defined $helper_sock) {
+        # No helper - either Step 2 in-process mode or monitor-only mode
+        # In monitor-only mode, this shouldn't be called for state-changing ops
+        # In Step 2, fall back to direct dispatch
+        my $json_str = encode_json(\%args);
+        return dispatch_command(decode_json($json_str));
+    }
+
+    # Ignore SIGPIPE locally; convert write failures to error returns
+    local $SIG{PIPE} = 'IGNORE';
+    
+    print $helper_sock encode_json(\%args) . "\n";
+    my $line = <$helper_sock>;
+    if (!defined $line) {
+        logmsg('alert', 'Helper communication failed: no response');
+        die "Lost connection to privileged helper, exiting.\n";
+    }
+    chomp $line;
+    my $resp;
+    eval { $resp = decode_json($line); };
+    if ($@) {
+        logmsg('alert', "Invalid JSON response from helper: $line");
+        return {status => 'err', reason => 'invalid JSON response'};
+    }
+    return $resp;
+}
+
+# Subroutine to return 1 if request returned successfully.
+sub helper_ok {
+    my (%args) = @_;
+    my $resp = helper_request (%args);
+    return $resp->{status} eq 'ok';
+}
+
+# Wrapper to mirror run_cmd interface - logs failures and returns 0/1
+# Will migrate from run_cmd to helper_cmd, then get rid of run_cmd.
+sub helper_cmd {
+    my ($description, $log_failure, %args) = @_;
+    my $resp = helper_request (%args);
+    if ($resp->{status} ne 'ok') {
+        my $reason = $resp->{reason} // 'unknown';
+        my $msg = "Failed: $description: $reason";
         if ($log_failure) {
             logmsg ('alert', $msg);
         }
@@ -520,6 +832,18 @@ sub daemonize {
     # chdir ('/');
 }
 
+sub prepare_state_files_for_user {
+    my ($uid, $gid) = @_;
+    foreach my $file ($FAILD_INFO, $FAILD_PID) {
+        if (!-e $file) {
+            open(my $fh, '>', $file) or die "Cannot create $file: $!";
+            close($fh);
+        }
+        chown($uid, $gid, $file) or die "Cannot chown $file: $!";
+        chmod(0644, $file);
+    }
+}
+
 sub write_pid {
     # Write our PID to the already-locked file. Must be called after daemonize()
     # so that the child's PID (not the parent's) is recorded.
@@ -559,8 +883,8 @@ sub write_faild_info {
 
     print "Entering sub write_faild_info.\n" if ($DEBUG);
 
-    if (!open (FAILD_INFO, '>', "$FAILD_INFO.tmp")) {
-        logmsg ('alert', "Cannot open $FAILD_INFO.tmp for writing: $!");
+    if (!open (FAILD_INFO, '>', $FAILD_INFO)) {
+        logmsg ('alert', "Cannot open $FAILD_INFO for writing: $!");
         return;
     }
     for ($idx = 0; $idx <= $#GATEWAYS; $idx++) {
@@ -569,9 +893,6 @@ sub write_faild_info {
     if (!close (FAILD_INFO)) {
         logmsg ('alert', "Error closing $FAILD_INFO.tmp: $!");
         return;
-    }
-    if (!rename ("$FAILD_INFO.tmp", $FAILD_INFO)) {
-        logmsg ('alert', "Cannot rename $FAILD_INFO.tmp to $FAILD_INFO: $!");
     }
 }
 
@@ -620,28 +941,12 @@ sub ping_gateways {
 # Subroutine to return dhcpleased information for an interface.
 sub get_dhcplease_info {
     my ($interface) = @_;
-    my ($dhcpleaseinfo, $interface_ip, $netmask, $gateway_ip, $lease_time, $units);
-
-    print "Entering sub get_dhcplease_info.\n" if ($DEBUG);
-
-    if (!open (DHCPLEASE, '-|', $DHCPLEASECTL, '-l', $interface)) {
-	logmsg ('alert', "Cannot run $DHCPLEASECTL -l $interface: $!");
-	return (undef, undef, undef, undef, undef);
+    my $resp = helper_request (cmd => 'DHCPLEASECTL_INFO', interface => $interface);
+    if ($resp->{status} ne 'ok') {
+        return (undef, undef, undef, undef, undef);
     }
-    local $/;
-    $dhcpleaseinfo = <DHCPLEASE>;
-    close (DHCPLEASE);
-    if ($dhcpleaseinfo =~ /inet (\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}) netmask (\d+\.\d+\.\d+\.\d+).*default gateway (\d+\.\d+\.\d+\.\d+).*lease (\d+) (hours|minutes)/s) {
-	$interface_ip = $1;
-	$netmask = $2;
-	$gateway_ip = $3;
-	$lease_time = $4;
-	$units = $5;
-    }
-    else {
-	print "Could not parse dhcpleasectl info. $dhcpleaseinfo\n" if ($DEBUG);
-    }
-    return ($interface_ip, $netmask, $gateway_ip, $lease_time, $units);
+    return ($resp->{ip}, $resp->{netmask}, $resp->{gateway}, 
+            $resp->{lease_time}, $resp->{units});
 }
 
 # Subroutine to report any state changes and failover to another
@@ -676,8 +981,8 @@ sub report_and_failover {
 		    $minutes_remaining = $lease_time;
 		}
 		if (defined ($minutes_remaining) && $minutes_remaining <= 5) {
-		    run_cmd ("renew DHCP lease on $INTERFACES[$idx]", 1,
-			     $DHCPLEASECTL, $INTERFACES[$idx]);
+		    helper_cmd ("renew DHCP lease on $INTERFACES[$idx]", 1,
+				cmd => 'DHCPLEASECTL_RENEW', interface => $INTERFACES[$idx]);
 		    # Give dhcpleased time to process the renewal and update its info.
 		    sleep 10;
 		    # Re-fetch lease info after renewal.
@@ -694,21 +999,21 @@ sub report_and_failover {
 		     $netmask ne $last_netmask[$idx] ||
 		     $gateway_ip ne $last_gateway_ip[$idx])) {
 		    # Flush states for old gateway IP.
-		    run_cmd ("flush pf states for $last_gateway_ip[$idx]", 1,
-			     $PFCTL, '-F', 'states', '-k', $last_gateway_ip[$idx]);
+		    helper_cmd ("flush pf states for $last_gateway_ip[$idx]", 1,
+				cmd => 'PFCTL_FLUSH_STATES', interface => $last_gateway_ip[$idx]);
 		    # If this is a backup gateway not currently in use, also delete
 		    # the stale default route for the old IP (dhcpleased may have
 		    # added a new one for the new IP, and we don't want both lingering).
 		    if ($idx != $current_gateway && 
 			$GATE_TYPE[$idx] == $DEDICATED_DHCPLEASE_BACKUP) {
-			run_cmd ("delete stale default route for old IP $last_gateway_ip[$idx]", 0,
-				 $ROUTE, '-n', 'delete', 'default', $last_gateway_ip[$idx]);
+			helper_cmd ("delete stale default route for old IP $last_gateway_ip[$idx]", 0,
+				    cmd => 'ROUTE_CHANGE_DEFAULT', ip => $last_gateway_ip[$idx]);
 		    }
 		    # If this gateway is currently in use, the default route needs to
 		    # be updated to point to the new gateway IP.
 		    elsif ($idx == $current_gateway) {
-			run_cmd ("change default route to new IP $gateway_ip", 1,
-				 $ROUTE, '-n', 'change', 'default', $gateway_ip);
+			helper_cmd ("change default route to new IP $gateway_ip", 1,
+				    cmd => 'ROUTE_CHANGE_DEFAULT', ip => $gateway_ip);
 		    }
 		    # Also update the stored GATEWAYS and PING_IPS if they match the old IP.
 		    # This handles the case where the config specifies the dhcp-assigned IP
@@ -738,8 +1043,8 @@ sub report_and_failover {
 	    if (defined ($gateway_ip) &&
 		$idx != $current_gateway && 
 		$GATE_TYPE[$idx] == $DEDICATED_DHCPLEASE_BACKUP) {
-		run_cmd ("delete default route for $gateway_ip", 0,
-			 $ROUTE, '-n', 'delete', 'default', $gateway_ip);
+		helper_cmd ("delete default route for $gateway_ip", 0,
+			    cmd => 'ROUTE_DELETE_DEFAULT', ip => $gateway_ip);
 	    }
 	}
 
@@ -770,8 +1075,8 @@ sub report_and_failover {
 		# We want to delete default route if it's a backup, unless we
 		# need it.
 		if ($idx != $current_gateway && $GATE_TYPE[$idx] == $DEDICATED_DHCPLEASE_BACKUP) {
-		    run_cmd ("delete default route for backup $gateway_ip", 0,
-			     $ROUTE, '-n', 'delete', 'default', $gateway_ip);
+		    helper_cmd ("delete default route for backup $gateway_ip", 0,
+				cmd => 'ROUTE_DELETE_DEFAULT', ip => $gateway_ip);
 		}
 	    }
 	    else {
@@ -886,10 +1191,10 @@ sub report_and_failover {
 		    # Change default route.  (Might need to add if there isn't one.)
 		    # Try change first, then add - one of these will succeed depending on
 		    # whether a default route already exists.
-		    my $changed = run_cmd ("change default route to $GATEWAYS[$idx]", 0,
-					   $ROUTE, '-n', 'change', 'default', $GATEWAYS[$idx]);
-		    my $added = run_cmd ("add default route to $GATEWAYS[$idx]", 0,
-					 $ROUTE, '-n', 'add', 'default', $GATEWAYS[$idx]);
+		    my $changed = helper_cmd ("change default route to $GATEWAYS[$idx]", 0,
+					      cmd => 'ROUTE_CHANGE_DEFAULT', ip => $GATEWAYS[$idx]);
+		    my $added = helper_cmd ("add default route to $GATEWAYS[$idx]", 0,
+					    cmd => 'ROUTE_ADD_DEFAULT', ip => $GATEWAYS[$idx]);
 		    if (!$changed && !$added) {
 			logmsg ('alert', "Failed to set default route to $GATEWAYS[$idx] (both change and add failed)");
 		    }
@@ -899,12 +1204,12 @@ sub report_and_failover {
 			delete_routes ($ROUTES[$prior_gateway]);
 		    }
 		    else {
-			run_cmd ("flush routes for interface $INTERFACES[$prior_gateway]", 1,
-				 $ROUTE, 'flush', '-iface', $INTERFACES[$prior_gateway]);
+			helper_cmd ("flush routes for interface $INTERFACES[$prior_gateway]", 1,
+				    cmd => 'ROUTE_FLUSH_IFACE', interface => $INTERFACES[$prior_gateway]);
 		    }
 		    # Flush pf states for prior gateway.
-		    run_cmd ("flush pf states for $GATEWAYS[$prior_gateway]", 1,
-			     $PFCTL, '-F', 'states', '-k', $GATEWAYS[$prior_gateway]);
+		    helper_cmd ("flush pf states for $GATEWAYS[$prior_gateway]", 1,
+				cmd => 'PFCTL_FLUSH_STATES', ip => $GATEWAYS[$prior_gateway]);
 		    
 		}
 		last;
@@ -972,8 +1277,8 @@ sub add_routes {
     @route_array = split (/,/, $routes);
     foreach $route (@route_array) {
 	$route =~ s/P$//; # remove P for permanent routes
-	run_cmd ("add route $route via $gateway_ip", 1,
-                 $ROUTE, '-n', 'add', '-inet', $route, $gateway_ip);
+	helper_cmd ("add route $route via $gateway_ip", 0,
+		    cmd => 'ROUTE_ADD', cidr => $route, gateway => $gateway_ip);
     }
 }
 
@@ -985,8 +1290,8 @@ sub delete_routes {
     @route_array = split (/,/, $routes);
     foreach $route (@route_array) {
 	next if $route =~ /P$/; # do not remove permanent routes
-	run_cmd ("delete route $route", 1,
-                 $ROUTE, '-n', 'delete', '-inet', $route);
+	helper_cmd ("delete route $route", 0,
+		    cmd => 'ROUTE_DELETE', cidr => $route);
     }
 }
 
@@ -1000,8 +1305,8 @@ sub add_missing_perm_routes {
 	next if $route !~ /P$/; # ignore non-permanent routes
 	$route =~ s/P$//; # remove P for permanent routes
 	if (!route_present ($route, $gateway_ip)) {
-	    if (run_cmd ("add missing permanent route $route via $gateway_ip", 1,
-			 $ROUTE, '-n', 'add', '-inet', $route, $gateway_ip)) {
+	    if (helper_cmd ("add missing permanent route $route via $gateway_ip", 1,
+			    cmd => 'ROUTE_ADD', cidr => $route, gateway => $gateway_ip)) {
 		my $message = "Added missing permanent route $route for $gateway_ip.";
 		logmsg ('alert', $message);
 		print "$message\n" if ($DEBUG);
