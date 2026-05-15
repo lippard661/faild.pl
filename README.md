@@ -3,14 +3,18 @@ Script to monitor Internet connections and remote hosts for uptime and generate 
 
 Also found at https://www.discord.org/lippard/software/
 
-faild.pl 1.19 of 14 May 2026
+faild.pl 1.20 of 15 May 2026
 
+1.20 does privilege separation.
 1.19 replaces Net::Ping with system call to ping as preparation
 for privilege separation; properly daemonizes.
 
 Config file format (/etc/faild.conf):
 <PRE>
  # Comment format
+ #state_dir: /var/run
+ #perform_failover: [yes|no] no = monitor mode, no privs*; yes = priv mode
+ #  * exception: dhcplease interfaces require priv mode
  page_source: email-addr (where alerts are sent from)
  page_destination: email-addr (where alerts are sent to)
  # Then as many of these triplets as you want:
