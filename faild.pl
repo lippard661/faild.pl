@@ -791,8 +791,9 @@ sub helper_ok {
     return $resp->{status} eq 'ok';
 }
 
-# Wrapper to mirror run_cmd interface - logs failures and returns 0/1
-# Will migrate from run_cmd to helper_cmd, then get rid of run_cmd.
+# Wrapper to mirror former run_cmd interface - logs failures and returns 0/1;
+# migrated from run_cmd to helper_cmd, then removed run_cmd in transition
+# to privsep model.
 sub helper_cmd {
     my ($description, $log_failure, %args) = @_;
     my $resp = helper_request (%args);
