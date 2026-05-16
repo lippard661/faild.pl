@@ -1000,14 +1000,14 @@ sub report_and_failover {
 		     $gateway_ip ne $last_gateway_ip[$idx])) {
 		    # Flush states for old gateway IP.
 		    helper_cmd ("flush pf states for $last_gateway_ip[$idx]", 1,
-				cmd => 'PFCTL_FLUSH_STATES', interface => $last_gateway_ip[$idx]);
+				cmd => 'PFCTL_FLUSH_STATES', ip => $last_gateway_ip[$idx]);
 		    # If this is a backup gateway not currently in use, also delete
 		    # the stale default route for the old IP (dhcpleased may have
 		    # added a new one for the new IP, and we don't want both lingering).
 		    if ($idx != $current_gateway && 
 			$GATE_TYPE[$idx] == $DEDICATED_DHCPLEASE_BACKUP) {
 			helper_cmd ("delete stale default route for old IP $last_gateway_ip[$idx]", 0,
-				    cmd => 'ROUTE_CHANGE_DEFAULT', ip => $last_gateway_ip[$idx]);
+				    cmd => 'ROUTE_DELETE_DEFAULT', ip => $last_gateway_ip[$idx]);
 		    }
 		    # If this gateway is currently in use, the default route needs to
 		    # be updated to point to the new gateway IP.
