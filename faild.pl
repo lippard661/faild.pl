@@ -229,6 +229,10 @@ if ($^O eq 'openbsd') {
     unveil (); # done unveiling, lock it
 }
 
+if ($PERFORM_FAILOVER && $^O ne 'openbsd') {
+    die "Failover is only supported on OpenBSD.\n";
+}
+
 my ($running_as_root, $need_helper) = determine_privilege_mode();
 
 # Check that state_dir is writable for the eventual runtime user
@@ -508,7 +512,7 @@ sub is_cidr {
 sub is_interface {
     my ($if) = @_;
     return 0 unless defined ($if);
-    return 0 unless ($if =~ /^[a-z]+\d+$/);
+    return 0 unless ($if =~ /^[a-z]+\d+(\.\d+)?$/);
     return 0 if (length ($if) >= 16);
     return 1;
 }
@@ -578,6 +582,9 @@ sub setup_privsep {
         # Parent: become the helper
         close($child_sock);
         $0 = 'faild [priv]';
+
+	# Close the PID file, let the child/worker keep it open.
+	close (PID);
 
 	# Setup signal handlers.
 	$SIG{TERM} = sub { exit(0); };
@@ -686,6 +693,13 @@ sub run_helper_cmd {
     if (system (@cmd) == 0) {
         return {status => 'ok'};
     }
+    elsif ($rc == -1) {
+	return {status => 'err', reason => "exec failed: $!"};
+    }
+    elsif ($? & 127) {
+        my $sig = $? & 127;
+        return {status => 'err', reason => "killed by signal $sig"};
+    }
     else {
         my $exit = $? >> 8;
         return {status => 'err', reason => "exit $exit"};
@@ -715,6 +729,7 @@ sub get_dhcp_info {
         };
     }
     else {
+	logmsg('alert', "Could not parse dhcpleasectl output - format may have changed");
         return {status => 'err', reason => 'cannot parse dhcpleasectl output'};
     }
 }
@@ -741,7 +756,10 @@ sub helper_request {
     my $line;
 
     eval {
-	print $helper_sock encode_json(\%args) . "\n";
+	my $written = print $helper_sock encode_json(\%args) . "\n";
+	if (!$written) {
+	    die "helper write failed: $!\n";
+	}
 	$line = <$helper_sock>;
     };
     alarm(0);
@@ -859,6 +877,9 @@ sub prepare_state_files_for_user {
         if (!@st || !-f _) {
             die "$file is not a regular file\n";
         }
+	if ($st[3] > 1) { # nlink > 1 means there are hard links
+	    die "$file has hard links - possible attack\n";
+	}
         chown($uid, $gid, $file) or die "Cannot chown $file: $!";
         chmod(0644, $file);
     }
