@@ -81,6 +81,9 @@
 # 1.20 15 May 2026: Added privilege separation, state_dir: for config file,
 #      can run as nonpriv user, in monitor-only mode with no priv process,
 #      will drop privs and restrict pledges.
+# 1.21 16 May 2026: Issues corrected after Claude, ChatGPT, and Gemini reviews;
+#      each identified different issues and some very minor (and sometimes
+#      incorrect for various reasons).
 
 # ToDo: Some former "constants" are now variables from the config and should
 # consider moving them to the variables section and making them all
@@ -274,6 +277,7 @@ pledge (@RUNTIME_PROMISES) if ($^O eq 'openbsd');
 # Set up signal handlers in child
 $SIG{TERM} = sub {
     logmsg('info', 'Received SIGTERM, exiting cleanly');
+    unlink ($FAILD_PID); # Best effort cleanup.
     exit(0);
 };
 $SIG{INT} = $SIG{TERM};
@@ -477,26 +481,14 @@ sub is_email {
 
 # Validation functions
 sub is_ipaddr {
-    my ($ip) = @_;
-    return 0 unless defined ($ip);
-    return 0 unless ($ip =~ /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-    return 0 if ($1 == 0); # First octet must be non-zero
+    my ($ipaddr) = @_;
+    return 0 unless defined ($ipaddr);
+    return 0 unless ($ipaddr =~ /^(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})$/);
+    return 0 if ($1 == 0);
     foreach my $octet ($1, $2, $3, $4) {
         return 0 if ($octet > 255);
     }
     return 1;
-}
-
-# Subroutine to check numeric range of octet.
-sub is_octet {
-    my ($octet) = @_;
-
-    if ($octet >= 0 && $octet <= 255) {
-	return 1;
-    }
-    else {
-	return 0;
-    }
 }
 
 # Subroutine to check format of CIDR block.
@@ -823,6 +815,7 @@ sub initialize_states {
     if ($current_gateway == -1) {
 	logmsg ('alert', "Current gateway ($ip) is not in faild.pl configuration.");
 	send_page ("faild.pl: Current gateway ($ip) is not in faild.pl configuration.");
+	$current_gateway = 0; # Assume primary, will be fixed up on next cycle.
     }
 
     for ($idx = 0; $idx <= $#GATEWAYS; $idx++) {
@@ -873,17 +866,24 @@ sub prepare_state_files_for_user {
         if (!sysopen($fh, $file, O_RDWR | O_CREAT | O_NOFOLLOW, 0644)) {
             die "Cannot open $file: $!\n";
         }
-        close($fh);
         # Verify it's a regular file (not a symlink, hardlink we shouldn't touch, etc.)
-        my @st = lstat($file);
+        my @st = stat($fh);
         if (!@st || !-f _) {
+	    close ($fh);
             die "$file is not a regular file\n";
         }
 	if ($st[3] > 1) { # nlink > 1 means there are hard links
 	    die "$file has hard links - possible attack\n";
 	}
-        chown($uid, $gid, $file) or die "Cannot chown $file: $!";
-        chmod(0644, $file);
+        chown($uid, $gid, $fh) or do {
+	    close ($fh);
+	    die "Cannot chown $file: $!\n";
+	};
+        chmod(0644, $fh) or do {
+	    close ($fh);
+	    die "Cannot chmod $file: $!\n";
+	};
+	close ($fh);
     }
 }
 
@@ -1283,7 +1283,7 @@ sub report_and_failover {
 
 # Subroutine to return IP address of current gateway.
 sub gateway_ip {
-    my ($ip);
+    my @ips;
 
     if (!open (ROUTE, '-|', $ROUTE, '-n', 'show')) {
         logmsg ('alert', "Cannot run $ROUTE -n show: $!");
@@ -1291,11 +1291,24 @@ sub gateway_ip {
     }
     while (<ROUTE>) {
         if (/^default\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s+UG/) {
-	    $ip = $1;
+	    push (@ips, $1);
         }
     }
     close (ROUTE);
-    return $ip;
+
+    return undef unless (@ips);
+
+    # If multiple defaults exist, prefer the highest-priority (lowest-index)
+    # gateway from our config. This handles multipath routing setups where
+    # multiple default routes may exist temporarily.
+    foreach my $cfg_idx (0 .. $#GATEWAYS) {
+        foreach my $ip (@ips) {
+            return $ip if ($ip eq $GATEWAYS[$cfg_idx]);
+        }
+    }
+    
+    # No configured gateway matches any current default - return first one found
+    return $ips[0];
 }
 
 # Subroutine to return index of gateway as specified by IP address.
