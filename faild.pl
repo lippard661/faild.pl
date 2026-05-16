@@ -92,7 +92,7 @@ use strict;
 use warnings;
 use base; # required by Privileges::Drop;
 use English; # required by Privileges::Drop;
-use Fcntl qw( :flock );
+use Fcntl qw( :DEFAULT :flock );
 use IO::Handle;
 use JSON::PP;
 use POSIX;
@@ -237,7 +237,7 @@ if (!$running_as_root) {
     if (!-w $STATE_DIR) {
         die "Cannot use state_dir '$STATE_DIR' - not writable by current user.\n" .
             "Set state_dir in $FAILD_CONF to a directory writable by your user, " .
-            "e.g., '/tmp' or '\$HOME/.faild'.\n";
+            "e.g., '\$HOME/.faild'.\n";
     }
 }
 # When running as root, the directory will be made accessible to _faild
@@ -735,9 +735,22 @@ sub helper_request {
 
     # Ignore SIGPIPE locally; convert write failures to error returns
     local $SIG{PIPE} = 'IGNORE';
+    local $SIG{ALRM} = sub { die "helper timeout\n"; };
+    alarm(30);  # 30 seconds max for any helper operation
+
+    my $line;
+
+    eval {
+	print $helper_sock encode_json(\%args) . "\n";
+	$line = <$helper_sock>;
+    };
+    alarm(0);
+
+    if ($@) {
+        logmsg('alert', "Helper request failed, exiting: $@");
+        die "Lost connection to privileged helper\n";
+    }
     
-    print $helper_sock encode_json(\%args) . "\n";
-    my $line = <$helper_sock>;
     if (!defined $line) {
         logmsg('alert', 'Helper communication failed: no response, exiting.');
         die "Lost connection to privileged helper, exiting.\n";
@@ -835,9 +848,16 @@ sub daemonize {
 sub prepare_state_files_for_user {
     my ($uid, $gid) = @_;
     foreach my $file ($FAILD_INFO, $FAILD_PID) {
-        if (!-e $file) {
-            open(my $fh, '>', $file) or die "Cannot create $file: $!";
-            close($fh);
+        # Create if missing, using O_NOFOLLOW to prevent symlink attacks
+        my $fh;
+        if (!sysopen($fh, $file, O_RDWR | O_CREAT | O_NOFOLLOW, 0644)) {
+            die "Cannot open $file: $!\n";
+        }
+        close($fh);
+        # Verify it's a regular file (not a symlink, hardlink we shouldn't touch, etc.)
+        my @st = lstat($file);
+        if (!@st || !-f _) {
+            die "$file is not a regular file\n";
         }
         chown($uid, $gid, $file) or die "Cannot chown $file: $!";
         chmod(0644, $file);
@@ -875,7 +895,7 @@ sub read_faild_info {
 	}
 	close (FAILD_INFO);
     }
-    $more_gateways_than_recorded = 1 if ($gateway_count < $#GATEWAYS);
+    $more_gateways_than_recorded = 1 if ($gateway_count < scalar (@GATEWAYS));
 }
 
 sub write_faild_info {
@@ -1204,8 +1224,10 @@ sub report_and_failover {
 			delete_routes ($ROUTES[$prior_gateway]);
 		    }
 		    else {
-			helper_cmd ("flush routes for interface $INTERFACES[$prior_gateway]", 1,
-				    cmd => 'ROUTE_FLUSH_IFACE', interface => $INTERFACES[$prior_gateway]);
+			if (defined ($INTERFACES[$prior_gateway])) {
+			    helper_cmd ("flush routes for interface $INTERFACES[$prior_gateway]", 1,
+					cmd => 'ROUTE_FLUSH_IFACE', interface => $INTERFACES[$prior_gateway]);
+			}
 		    }
 		    # Flush pf states for prior gateway.
 		    helper_cmd ("flush pf states for $GATEWAYS[$prior_gateway]", 1,
