@@ -3,7 +3,7 @@ Script to monitor Internet connections and remote hosts for uptime and generate 
 
 Also found at https://www.discord.org/lippard/software/
 
-faild.pl 1.20 of 15 May 2026
+faild.pl 1.21 of 16 May 2026
 
 1.20 does privilege separation.
 1.19 replaces Net::Ping with system call to ping as preparation
