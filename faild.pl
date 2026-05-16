@@ -690,7 +690,8 @@ sub dispatch_command {
 # Run a privileged system command, return JSON-encodable result
 sub run_helper_cmd {
     my (@cmd) = @_;
-    if (system (@cmd) == 0) {
+    my $rc = system (@cmd);
+    if ($rc == 0) {
         return {status => 'ok'};
     }
     elsif ($rc == -1) {
