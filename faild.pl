@@ -84,6 +84,9 @@
 # 1.21 16 May 2026: Issues corrected after Claude, ChatGPT, and Gemini reviews;
 #      each identified different issues and some very minor (and sometimes
 #      incorrect for various reasons).
+# 1.22 7 June 2026: Remove logmsg call from get_dhcp_info which is on the priv
+#      helper side; then went ahead and made get_dhcp_info more resilient to
+#      different format lease times.
 
 # ToDo: Some former "constants" are now variables from the config and should
 # consider moving them to the variables section and making them all
@@ -108,7 +111,7 @@ use if $^O eq "openbsd", "OpenBSD::Unveil";
 
 ### Constants.
 
-my $VERSION = 'faild.pl 1.20 of 15 May 2026';
+my $VERSION = 'faild.pl 1.22 of 7 June 2026';
 
 # Pledge promise groups - stdio is added automatically by OpenBSD::Pledge
 my @READONLY_PROMISES     = ('rpath');
@@ -170,7 +173,7 @@ my %PING_NAME = (1, 'first',
 my (@GATEWAYS, @INTERFACES, @ROUTES, @PING_IPS, @GATE_TYPE);
 
 my $FAILD_CONF = '/etc/faild.conf';
-my $STATE_DIR = '/var/run';; # default
+my $STATE_DIR = '/var/run'; # default
 my $FAILD_INFO; # default = '/var/run/faild.info';
 my $FAILD_PID; # default = '/var/run/faild.pid';
 
@@ -710,20 +713,62 @@ sub get_dhcp_info {
     while (<$fh>) { $output .= $_; }
     close ($fh);
     
-    # Match existing parsing logic from old get_dhcplease_info
-    if ($output =~ /inet (\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}) netmask (\d+\.\d+\.\d+\.\d+).*default gateway (\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}).*lease (\d+) (hours|minutes)/s) {
+    # Extract each field independently
+    my ($ip, $netmask, $gateway, $lease_seconds);
+    
+    if ($output =~ /inet (\d+\.\d+\.\d+\.\d+) netmask (\d+\.\d+\.\d+\.\d+)/) {
+        $ip = $1;
+        $netmask = $2;
+    }
+    
+    if ($output =~ /default gateway (\d+\.\d+\.\d+\.\d+)/) {
+        $gateway = $1;
+    }
+    
+    # Try multiple lease formats
+    if ($output =~ /lease (\d+) hours?/) {
+        $lease_seconds = $1 * 3600;
+    }
+    elsif ($output =~ /lease (\d+) minutes?/) {
+        $lease_seconds = $1 * 60;
+    }
+    elsif ($output =~ /lease (\d+) seconds?/) {
+        $lease_seconds = $1;
+    }
+    elsif ($output =~ /lease\s+(?:(\d+)h\s*)?(?:(\d+)m\s*)?(?:(\d+)s\s*)?/) {
+        # Compound format: lease 7h 45m 31s
+        $lease_seconds = ($1 // 0) * 3600 + ($2 // 0) * 60 + ($3 // 0);
+    }
+    
+    # Validate we got the required fields
+    if (defined($ip) && defined($netmask) && defined($gateway) && defined($lease_seconds)) {
+        # Convert back to hours/minutes for compatibility with existing worker code
+        my ($lease_time, $units);
+        if ($lease_seconds >= 3600 && $lease_seconds % 3600 == 0) {
+            $lease_time = $lease_seconds / 3600;
+            $units = 'hours';
+        }
+        else {
+            $lease_time = int($lease_seconds / 60);
+            $units = 'minutes';
+        }
         return {
             status => 'ok',
-            ip => $1,
-            netmask => $2,
-            gateway => $3,
-            lease_time => int($4),
-            units => $5,
+            ip => $ip,
+            netmask => $netmask,
+            gateway => $gateway,
+            lease_time => $lease_time,
+            units => $units,
         };
     }
     else {
-	logmsg('alert', "Could not parse dhcpleasectl output - format may have changed");
-        return {status => 'err', reason => 'cannot parse dhcpleasectl output'};
+        # Build diagnostic listing what was missing
+        my @missing;
+        push @missing, 'ip' unless defined $ip;
+        push @missing, 'netmask' unless defined $netmask;
+        push @missing, 'gateway' unless defined $gateway;
+        push @missing, 'lease' unless defined $lease_seconds;
+        return {status => 'err', reason => 'parse failed, missing: ' . join(',', @missing)};
     }
 }
 
@@ -986,6 +1031,8 @@ sub get_dhcplease_info {
     my ($interface) = @_;
     my $resp = helper_request (cmd => 'DHCPLEASECTL_INFO', interface => $interface);
     if ($resp->{status} ne 'ok') {
+        my $reason = $resp->{reason} // 'unknown';
+        logmsg('alert', "DHCP info query for $interface failed: $reason");
         return (undef, undef, undef, undef, undef);
     }
     return ($resp->{ip}, $resp->{netmask}, $resp->{gateway}, 
