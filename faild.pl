@@ -87,6 +87,8 @@
 # 1.22 7 June 2026: Remove logmsg call from get_dhcp_info which is on the priv
 #      helper side; then went ahead and made get_dhcp_info more resilient to
 #      different format lease times.
+# 1.23 20 June 2026: Move state file to /var/db by default for persistence over reboots,
+#      make pid_dir configurable.
 
 # ToDo: Some former "constants" are now variables from the config and should
 # consider moving them to the variables section and making them all
@@ -111,7 +113,7 @@ use if $^O eq "openbsd", "OpenBSD::Unveil";
 
 ### Constants.
 
-my $VERSION = 'faild.pl 1.22 of 7 June 2026';
+my $VERSION = 'faild.pl 1.23 of 20 June 2026';
 
 # Pledge promise groups - stdio is added automatically by OpenBSD::Pledge
 my @READONLY_PROMISES     = ('rpath');
@@ -173,8 +175,9 @@ my %PING_NAME = (1, 'first',
 my (@GATEWAYS, @INTERFACES, @ROUTES, @PING_IPS, @GATE_TYPE);
 
 my $FAILD_CONF = '/etc/faild.conf';
-my $STATE_DIR = '/var/run'; # default
-my $FAILD_INFO; # default = '/var/run/faild.info';
+my $STATE_DIR = '/var/db'; # default
+my $PID_DIR = '/var/run'; # default
+my $FAILD_INFO; # default = '/var/db/faild.info';
 my $FAILD_PID; # default = '/var/run/faild.pid';
 
 my $DHCPLEASECTL = '/usr/sbin/dhcpleasectl';
@@ -216,7 +219,8 @@ if ($^O eq "openbsd") {
     pledge (@STARTUP_PROMISES) || die "Cannot pledge promises. $!\n";
     unveil ($FAILD_CONF, 'r');
     unveil ('/etc', 'r');
-    unveil ('/var/run', 'rwc');
+    unveil ($STATE_DIR, 'rwc');
+    unveil ($PID_DIR, 'rwc');
     unveil ('/dev/log', 'rw');
     unveil ('/dev/null', 'rw');
     unveil ($DHCPLEASECTL, 'x');
@@ -229,9 +233,10 @@ if ($^O eq "openbsd") {
 
 parse_config();
 $FAILD_INFO = "$STATE_DIR/faild.info";
-$FAILD_PID = "$STATE_DIR/faild.pid";
+$FAILD_PID = "$PID_DIR/faild.pid";
 if ($^O eq 'openbsd') {
     unveil ($STATE_DIR, 'rwc');
+    unveil ($PID_DIR, 'rwc');
     unveil (); # done unveiling, lock it
 }
 
@@ -247,6 +252,11 @@ if (!$running_as_root) {
     if (!-w $STATE_DIR) {
         die "Cannot use state_dir '$STATE_DIR' - not writable by current user.\n" .
             "Set state_dir in $FAILD_CONF to a directory writable by your user, " .
+            "e.g., '\$HOME/.faild'.\n";
+    }
+    if (!-w $PID_DIR) {
+        die "Cannot use pid_dir '$PID_DIR' - not writable by current user.\n" .
+            "Set pid_dir in $FAILD_CONF to a directory writable by your user, " .
             "e.g., '\$HOME/.faild'.\n";
     }
 }
@@ -325,6 +335,13 @@ sub parse_config {
 	    die "Invalid state_dir path: $STATE_DIR\n"
 		unless ($STATE_DIR =~ m{^/[\w/.-]+$} && length ($STATE_DIR) < 256);
 	    die "state_dir $STATE_DIR does not exist.\n" unless (-d $STATE_DIR);
+	}
+	elsif (/^\s*pid_dir:\s*(.*)$/) {
+	    $PID_DIR = $1;
+	    $PID_DIR =~ s|/+$||; # remove any trailing slashes
+	    die "Invalid pid_dir path: $PID_DIR\n"
+		unless ($PID_DIR =~ m{^/[\w/.-]+$} && length ($PID_DIR) < 256);
+	    die "pid_dir $PID_DIR does not exist.\n" unless (-d $PID_DIR);
 	}
 	elsif (/^\s*page_source:\s*(.*)$/) {
 	    if (is_email ($1)) {
