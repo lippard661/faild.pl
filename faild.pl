@@ -18,7 +18,10 @@
 # interface: <interface name> [optional, but needed for dhcplease]
 # routes: <cidr>, <cidr>, <cidr> [optional only for dhcplease, use "P" after
 #    cidr for permanent route that should not be removed if gateway goes down
-# ping_ip: <ip>
+# ping_ip: <ip>[, <ip>[, <ip>]] (up to 3 IPs)
+#         If multiple IPs are specified, the gateway is considered up if
+#         a ping to ANY of them succeeds. This allows tolerating individual
+#         ping target outages.
 # type: <dedicated|dedicated-dhcplease-primary|dedicated-dhcplease-backup|on-demand|host>
 
 # Issues/To Do:
@@ -87,8 +90,9 @@
 # 1.22 7 June 2026: Remove logmsg call from get_dhcp_info which is on the priv
 #      helper side; then went ahead and made get_dhcp_info more resilient to
 #      different format lease times.
-# 1.23 20 June 2026: Move state file to /var/db by default for persistence over reboots,
-#      make pid_dir configurable.
+# 1.23 20 June 2026: Move state file to /var/db by default for persistence
+#      over reboots, make pid_dir configurable.
+# 1.24 24 June 2026: Allow multiple ping IPs.
 
 # ToDo: Some former "constants" are now variables from the config and should
 # consider moving them to the variables section and making them all
@@ -113,7 +117,7 @@ use if $^O eq "openbsd", "OpenBSD::Unveil";
 
 ### Constants.
 
-my $VERSION = 'faild.pl 1.23 of 20 June 2026';
+my $VERSION = 'faild.pl 1.24 of 24 June 2026';
 
 # Pledge promise groups - stdio is added automatically by OpenBSD::Pledge
 my @READONLY_PROMISES     = ('rpath');
@@ -299,7 +303,7 @@ write_pid();
 
 # Infinite loop.
 while (1) {
-    ping_gateways();
+    ping_all_gateways();
     report_and_failover();
 
     print "Sleeping for $SLEEP_TIME seconds.\n" if ($DEBUG);
@@ -425,13 +429,17 @@ sub parse_config {
 	    if ($have_ping_ip) {
 		die "Already have a ping IP for gateway. $_\n";
 	    }
-	    if (is_ipaddr ($1)) {
-		push (@PING_IPS, $1);
-		$have_ping_ip = 1;
+	    my @ips = split (/\s*,\s*/, $1);
+	    if (@ips < 1 || @ips > 3) {
+		die "ping_ip must specify 1-3 IPs. $_\n";
 	    }
-	    else {
-		die "Invalid ping IP address. $1\n";
+	    my %seen;
+	    foreach my $ip (@ips) {
+		die "Invalid ping IP address. $ip\n" unless is_ipaddr($ip);
+		die "Duplicate ping IP. $ip\n" if $seen{$ip}++;
 	    }
+	    $PING_IPS[$gateway_idx] = [@ips];
+	    $have_ping_ip = 1;
 	}
 	elsif (/\s*type:\s*(.*)$/) {
 	    if ($have_type) {
@@ -1003,14 +1011,14 @@ sub write_faild_info {
 
 # Set new_state for all gateways as up or down.  No test is performed
 # for on-demand gateways not in use but believed to be up.
-sub ping_gateways {
+sub ping_all_gateways {
     my ($idx);
 
     print "Entering sub ping_gateways.\n" if ($DEBUG);
 
     for ($idx = 0; $idx <= $#GATEWAYS; $idx++) {
 	$gate_type_name = $GATE_TYPE_NAME[$GATE_TYPE[$idx]];
-	if (ping_host ($PING_IPS[$idx], $PING_TIMEOUT)) {
+	if (ping_gateway_ips ($idx, $PING_TIMEOUT)) {
 	    $new_state[$idx] = $UP;
 	    print "$gate_type_name $idx ($GATEWAYS[$idx]) is up on the first ping.\n" if ($DEBUG);
 	}
@@ -1027,7 +1035,7 @@ sub ping_gateways {
 	$gate_type_name = $GATE_TYPE_NAME[$GATE_TYPE[$idx]];
 	if ($new_state[$idx] == $DOWN) {
 	    for ($n_pings = 2; $n_pings < $N_PINGS_DOWN+1; $n_pings++) {
-		if (ping_host ($PING_IPS[$idx], $PING_TIMEOUT)) {
+		if (ping_gateway_ips ($idx, $PING_TIMEOUT)) {
 		    $new_state[$idx] = $UP;
 		    print "$gate_type_name $idx ($GATEWAYS[$idx]) is up on the $PING_NAME{$n_pings} ping.\n" if ($DEBUG);
 		    logmsg ('alert', "$gate_type_name $idx ($GATEWAYS[$idx]) is up on the $PING_NAME{$n_pings} ping.") if ($n_pings > $N_PINGS_TO_NOTIFY);
@@ -1128,9 +1136,13 @@ sub report_and_failover {
 		    if ($GATEWAYS[$idx] eq $last_gateway_ip[$idx]) {
 			$GATEWAYS[$idx] = $gateway_ip;
 		    }
-		    if ($PING_IPS[$idx] eq $last_gateway_ip[$idx]) {
-			$PING_IPS[$idx] = $gateway_ip;
-		    }
+		    # If any ping IP matches the old gateway IP (i.e., we were pinging the gateway 
+		    # itself, possibly as the default), update it to the new gateway IP
+		    for (my $jdx = 0; $jdx <= $#{$PING_IPS[$idx]}; $jdx++) {
+			if ($PING_IPS[$idx]->[$jdx] eq $last_gateway_ip[$idx]) {
+			    $PING_IPS[$idx]->[$jdx] = $gateway_ip;
+			}
+		    }	    
 		    my $message = "DHCP lease changed for $gate_type_name $idx: " .
 			"interface IP $last_interface_ip[$idx]->$interface_ip, " .
 			"netmask $last_netmask[$idx]->$netmask, " .
@@ -1491,6 +1503,27 @@ sub send_page {
     print MAIL "To: $PAGE_DESTINATION\n\n";
     print MAIL "$msg\n";
     close (MAIL);
+}
+
+# Ping all configured IPs for a gateway in sequence. Return success if any
+# of them respond. This allows tolerating individual ping target outages
+# (e.g., a public DNS resolver having issues).
+sub ping_gateway_ips {
+    my ($idx, $timeout) = @_;
+    return 0 unless defined $PING_IPS[$idx];
+    my @failed;
+    foreach my $ip (@{$PING_IPS[$idx]}) {
+	if (ping_host ($ip, $timeout)) {
+	    if (@failed) {
+		my $msg = "Ping IPs failed for gateway $idx: " . join(',', @failed) . " (but $ip succeeded)\n";
+		print $msg if ($DEBUG);
+		logmsg ('alert', $msg);
+	    }
+        return 1;
+	}
+	push @failed, $ip;
+    }
+    return 0;
 }
 
 # Ping gateways or hosts.
