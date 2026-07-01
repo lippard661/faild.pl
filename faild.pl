@@ -198,7 +198,7 @@ my ($PAGE_SOURCE, $PAGE_DESTINATION);
 
 ### Variables.
 
-my ($current_gateway, @current_state, @new_state, @state_time, @pings_down, $n_pings);
+my ($current_gateway, @current_state, @new_state, @state_time, @pings_down);
 my ($gate_type_name, $more_gateways_than_recorded);
 my (@last_interface_ip, @last_netmask, @last_gateway_ip);
 my ($faild_uid, $faild_gid);
@@ -1023,7 +1023,7 @@ sub write_faild_info {
 # for on-demand gateways not in use but believed to be up.
 sub ping_all_gateways {
     my ($idx);
-    my ($gate_type_name, $n_pings, $gateway_ip);
+    my ($gate_type_name, $n_pings);
 
     print "Entering sub ping_gateways.\n" if ($DEBUG);
 
@@ -1082,7 +1082,7 @@ sub report_and_failover {
     my ($changes_occurred, $duration, $plural);
     my ($interface_ip, $netmask, $gateway_ip, $lease_time, $units);
     my ($prior_gateway);
-    my ($gate_type_name, $n_pings, $gateway_ip);
+    my ($gate_type_name);
 
     print "Entering sub report_and_failover.\n" if ($DEBUG);
 
