@@ -93,6 +93,7 @@
 # 1.23 20 June 2026: Move state file to /var/db by default for persistence
 #      over reboots, make pid_dir configurable.
 # 1.24 24 June 2026: Allow multiple ping IPs.
+# 1.25 30 June 2026: Fix bugs after Claude Opus 4.8 review.
 
 # ToDo: Some former "constants" are now variables from the config and should
 # consider moving them to the variables section and making them all
@@ -117,7 +118,7 @@ use if $^O eq "openbsd", "OpenBSD::Unveil";
 
 ### Constants.
 
-my $VERSION = 'faild.pl 1.24 of 24 June 2026';
+my $VERSION = 'faild.pl 1.25 of 30 June 2026';
 
 # Pledge promise groups - stdio is added automatically by OpenBSD::Pledge
 my @READONLY_PROMISES     = ('rpath');
@@ -202,6 +203,7 @@ my ($gate_type_name, $more_gateways_than_recorded);
 my (@last_interface_ip, @last_netmask, @last_gateway_ip);
 my ($faild_uid, $faild_gid);
 my $helper_sock; # for privilege separation
+my $starting_up;
 
 
 ### Main program.
@@ -401,8 +403,7 @@ sub parse_config {
 		die "Already have an interface for gateway. $_\n";
 	    }
 	    $INTERFACES[$gateway_idx] = $1;
-	    die "Invalid interface name. $INTERFACES[$gateway_idx]\n" unless ($INTERFACES[$gateway_idx] =~ /^[\w\._]+$/ &&
-		length ($INTERFACES[$gateway_idx]) < 16);
+	    die "Invalid interface name. $INTERFACES[$gateway_idx]\n" unless (is_interface ($INTERFACES[$gateway_idx]));
 	    if ($^O eq 'openbsd') {
 		# no need to unveil specifically since /etc is unveiled with r
 		die "No /etc/hostname.$INTERFACES[$gateway_idx].\n" if (!-e "/etc/hostname.$INTERFACES[$gateway_idx]");
@@ -441,7 +442,7 @@ sub parse_config {
 	    $PING_IPS[$gateway_idx] = [@ips];
 	    $have_ping_ip = 1;
 	}
-	elsif (/\s*type:\s*(.*)$/) {
+	elsif (/^\s*type:\s*(.*)$/) {
 	    if ($have_type) {
 		die "Already have a type for gateway. $_\n";
 	    }
@@ -886,6 +887,10 @@ sub initialize_states {
 	logmsg ('alert', "Current gateway ($ip) is not in faild.pl configuration.");
 	send_page ("faild.pl: Current gateway ($ip) is not in faild.pl configuration.");
 	$current_gateway = 0; # Assume primary, will be fixed up on next cycle.
+	$starting_up = 1;
+    }
+    else {
+	$starting_up = 0;
     }
 
     for ($idx = 0; $idx <= $#GATEWAYS; $idx++) {
@@ -899,7 +904,9 @@ sub initialize_states {
 
 sub acquire_pid_lock {
     # Open and lock the PID file. Must be called before daemonize().
-    open (PID, '+>>', $FAILD_PID) || die "Cannot open PID file. $! $FAILD_PID\n";
+    if (!sysopen(PID, $FAILD_PID, O_RDWR | O_CREAT | O_NOFOLLOW, 0644)) {
+	die "Cannot open PID file. $! $FAILD_PID\n";
+    }
     if (!flock (PID, 2 | 4)) {  # LOCK_EX | LOCK_NB
         die "Another instance of faild.pl is already running.\n";
     }
@@ -980,11 +987,14 @@ sub read_faild_info {
 	    chomp;
 	    $gateway_count++;
 	    ($ip, $state, $saved_time) = split (/,\s+/);
+	    next unless (defined $ip && is_ipaddr ($ip));
 	    $idx = gate_index ($ip);
-	    if ($idx >= 0) {
-		$current_state[$idx] = $state;
-		$state_time[$idx] = $saved_time;
-	    }
+	    next unless ($idx >= 0);
+	    next unless (defined $state && $state =~ /^[01]$/); # UP or DOWN only
+	    next unless (defined $saved_time && $saved_time =~ /^\d+$/ # plausible epoch
+			 && $saved_time <= time());                    # not in the future
+	    $current_state[$idx] = $state;
+	    $state_time[$idx] = $saved_time;
 	}
 	close (FAILD_INFO);
     }
@@ -1004,7 +1014,7 @@ sub write_faild_info {
 	print FAILD_INFO "$GATEWAYS[$idx], $current_state[$idx], $state_time[$idx]\n";
     }
     if (!close (FAILD_INFO)) {
-        logmsg ('alert', "Error closing $FAILD_INFO.tmp: $!");
+        logmsg ('alert', "Error closing $FAILD_INFO: $!");
         return;
     }
 }
@@ -1013,6 +1023,7 @@ sub write_faild_info {
 # for on-demand gateways not in use but believed to be up.
 sub ping_all_gateways {
     my ($idx);
+    my ($gate_type_name, $n_pings, $gateway_ip);
 
     print "Entering sub ping_gateways.\n" if ($DEBUG);
 
@@ -1037,6 +1048,7 @@ sub ping_all_gateways {
 	    for ($n_pings = 2; $n_pings < $N_PINGS_DOWN+1; $n_pings++) {
 		if (ping_gateway_ips ($idx, $PING_TIMEOUT)) {
 		    $new_state[$idx] = $UP;
+		    $pings_down[$idx] = 0; # prevent miscount if it goes down in next minute
 		    print "$gate_type_name $idx ($GATEWAYS[$idx]) is up on the $PING_NAME{$n_pings} ping.\n" if ($DEBUG);
 		    logmsg ('alert', "$gate_type_name $idx ($GATEWAYS[$idx]) is up on the $PING_NAME{$n_pings} ping.") if ($n_pings > $N_PINGS_TO_NOTIFY);
 		    last;
@@ -1070,6 +1082,7 @@ sub report_and_failover {
     my ($changes_occurred, $duration, $plural);
     my ($interface_ip, $netmask, $gateway_ip, $lease_time, $units);
     my ($prior_gateway);
+    my ($gate_type_name, $n_pings, $gateway_ip);
 
     print "Entering sub report_and_failover.\n" if ($DEBUG);
 
@@ -1282,7 +1295,7 @@ sub report_and_failover {
 		    $current_gateway = $idx;
 		}
 		elsif ($idx > $current_gateway) {
-		    if ($current_gateway == -1) {
+		    if ($starting_up) {
 			logmsg ('alert', "Starting up with gateway $idx ($GATEWAYS[$idx]).");
 			print "Starting up with gateway $idx ($GATEWAYS[$idx]).\n";
 		    }
@@ -1292,11 +1305,6 @@ sub report_and_failover {
 			send_page ("faild.pl: Failing over from gateway $current_gateway ($GATEWAYS[$current_gateway]) to gateway $idx ($GATEWAYS[$idx]).");
 		    }
 		    $current_gateway = $idx;
-		}
-		else {
-		    logmsg ('alert', "Primary and current gateway $current_gateway ($GATEWAYS[$current_gateway]) is back up.");
-		    print "Primary and current gateway $current_gateway ($GATEWAYS[$current_gateway]) is back up.\n" if ($DEBUG);
-		    send_page ("faild.pl: Primary and current gateway $current_gateway ($GATEWAYS[$current_gateway]) is back up.");
 		}
 
 		# We found something to switch to.
@@ -1337,6 +1345,9 @@ sub report_and_failover {
 	    } # found up gateway
 	} # for loop
     } # current gateway down or not on primary gateway
+
+    # Once we've settled on an up gateway, we're no longer starting up.
+    $starting_up = 0 if ($new_state[$current_gateway] == $UP);
 
     # If there is more than one gateway and all are down, note that.
     if ($#GATEWAYS > 0 &&
