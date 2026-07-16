@@ -94,6 +94,7 @@
 #      over reboots, make pid_dir configurable.
 # 1.24 24 June 2026: Allow multiple ping IPs.
 # 1.25 30 June 2026: Fix bugs after Claude Opus 4.8 review.
+# 1.26 15 July 2026: Change route handling to add missing routes at start.
 
 # ToDo: Some former "constants" are now variables from the config and should
 # consider moving them to the variables section and making them all
@@ -148,6 +149,9 @@ my @GATE_TYPE_NAME = ('',
 
 my $UP = 1;
 my $DOWN = 0;
+
+my $ALL_ROUTES = 1;
+my $PERM_ONLY = 0;
 
 # User-configurable.
 my $DEBUG = 0;
@@ -204,6 +208,7 @@ my (@last_interface_ip, @last_netmask, @last_gateway_ip);
 my ($faild_uid, $faild_gid);
 my $helper_sock; # for privilege separation
 my $starting_up;
+my $first_cycle = 1;
 
 
 ### Main program.
@@ -302,6 +307,8 @@ $SIG{TERM} = sub {
 $SIG{INT} = $SIG{TERM};
 
 write_pid();
+
+initialize_routes();
 
 # Infinite loop.
 while (1) {
@@ -1080,7 +1087,6 @@ sub get_dhcplease_info {
 # gateway if necessary and possible.
 sub report_and_failover {
     my ($changes_occurred, $duration, $plural);
-    my ($interface_ip, $netmask, $gateway_ip, $lease_time, $units);
     my ($prior_gateway);
     my ($gate_type_name);
 
@@ -1089,6 +1095,7 @@ sub report_and_failover {
     # Report changes that have occurred.
     $changes_occurred = 0;
     for (my $idx = 0; $idx <= $#GATEWAYS; $idx++) {
+	my ($interface_ip, $netmask, $gateway_ip, $lease_time, $units);
 	$gate_type_name = $GATE_TYPE_NAME[$GATE_TYPE[$idx]];
 
 	# Check DHCP lease info for changes and expiring leases.
@@ -1180,6 +1187,12 @@ sub report_and_failover {
 	    }
 	}
 
+	# Routes are otherwise only added on a down->up transition, which never
+	# happens for a gateway that has been up since boot.
+	if ($first_cycle && defined ($ROUTES[$idx]) && $new_state[$idx] == $UP) {
+	    add_missing_routes ($ROUTES[$idx], $gateway_ip, $ALL_ROUTES);
+	}
+
 	if ($current_state[$idx] != $new_state[$idx]) {
 	    $changes_occurred = 1;
 	    $duration = time() - $state_time[$idx];
@@ -1231,7 +1244,7 @@ sub report_and_failover {
 	    # Add permanent routes if missing while down -- necessary to make
 	    # sure test pings still go out the right interface.
 	    if (defined ($ROUTES[$idx])) {
-		add_missing_perm_routes ($ROUTES[$idx], $GATEWAYS[$idx]);
+		add_missing_routes ($ROUTES[$idx], $GATEWAYS[$idx], $PERM_ONLY);
 	    }
 	    # Delete specific routes for outage of more than five minutes if
 	    # defined.
@@ -1348,6 +1361,7 @@ sub report_and_failover {
 
     # Once we've settled on an up gateway, we're no longer starting up.
     $starting_up = 0 if ($new_state[$current_gateway] == $UP);
+    $first_cycle = 0;
 
     # If there is more than one gateway and all are down, note that.
     if ($#GATEWAYS > 0 &&
@@ -1414,6 +1428,25 @@ sub gate_index {
     return -1;
 }
 
+# Establish permanent routes before the first ping, since without them a
+# gateway's test pings follow the default route out the wrong interface and
+# report a false "up".  hostname.if(5) normally sets these, but may not have
+# (e.g., network not ready at boot).
+sub initialize_routes {
+    my ($idx);
+
+    print "Entering sub initialize_routes.\n" if ($DEBUG);
+    for ($idx = 0; $idx <= $#GATEWAYS; $idx++) {
+	my $gw;
+        next if (!defined ($ROUTES[$idx]));
+        # ROUTES imply a dhcplease type with an interface; prefer the lease's
+        # gateway, fall back to the configured one.
+        (undef, undef, $gw, undef, undef) = get_dhcplease_info ($INTERFACES[$idx]);
+        $gw = $GATEWAYS[$idx] if (!defined ($gw));
+        add_missing_routes ($ROUTES[$idx], $gw, $PERM_ONLY);
+    }
+}
+
 # Subroutine to add routes. IPv4 only
 sub add_routes {
     my ($routes, $gateway_ip) = @_;
@@ -1440,24 +1473,25 @@ sub delete_routes {
     }
 }
 
-# Subroutine to add permanent routes if missing. IPv4 only
-sub add_missing_perm_routes {
-    my ($routes, $gateway_ip) = @_;
+# Subroutine to add routes if missing. IPv4 only.
+# Default is just the perm routes but $all_routes
+# adds all routes.
+sub add_missing_routes {
+    my ($routes, $gateway_ip, $all_routes) = @_;
     my (@route_array, $route);
 
+    return if (!defined ($gateway_ip));
     @route_array = split (/,/, $routes);
     foreach $route (@route_array) {
-	next if $route !~ /P$/; # ignore non-permanent routes
-	$route =~ s/P$//; # remove P for permanent routes
-	if (!route_present ($route, $gateway_ip)) {
-	    if (helper_cmd ("add missing permanent route $route via $gateway_ip", 1,
-			    cmd => 'ROUTE_ADD', cidr => $route, gateway => $gateway_ip)) {
-		my $message = "Added missing permanent route $route for $gateway_ip.";
-		logmsg ('alert', $message);
-		print "$message\n" if ($DEBUG);
-		send_page ("faild.pl: $message");
-	    }
-	}
+        next if (!$all_routes && $route !~ /P$/);
+        $route =~ s/P$//;
+        next if (route_present ($route, $gateway_ip));
+        if (helper_cmd ("add missing route $route via $gateway_ip", 1,
+                        cmd => 'ROUTE_ADD', cidr => $route, gateway => $gateway_ip)) {
+            my $message = "Added missing route $route for $gateway_ip.";
+            logmsg ('alert', $message);
+            print "$message\n" if ($DEBUG);
+        }
     }
 }
 
