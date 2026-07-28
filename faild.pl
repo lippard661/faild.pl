@@ -425,9 +425,10 @@ sub parse_config {
 	    }
 	}
 	elsif (/^\s*distinctive_ping_ttl:\s*(.*)$/) {
-	    if ($1 =~ /^\d+$/ &&
-		$1 > 1 && $1 <= 255) {
-		$distinctive_ping_ttl = $1;
+	    my $val = $1;
+	    if ($val =~ /^\d+$/ &&
+		$val > 1 && $val <= 255) {
+		$distinctive_ping_ttl = $val;
 	    }
 	    else {
 		die "distinctive_ping_ttl must be a decimal number between 2 and 255, not \"$1\".\n";
@@ -442,8 +443,9 @@ sub parse_config {
 	    }
 	}
 	elsif (/^\s*distinctive_ping_frequency:\s*(.*)$/) {
-	    if ($1 =~ /^\d+$/ && $1 > 1) {
-		$distinctive_ping_frequency = $1;
+	    my $val = $1;
+	    if ($val =~ /^\d+$/ && $val > 1) {
+		$distinctive_ping_frequency = $val;
 	    }
 	    else {
 		die "distinctive_ping_frequency must be a decimal number > 1, not \"$1\".\n";
