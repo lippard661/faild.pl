@@ -19,6 +19,7 @@ Config file format (/etc/faild.conf):
  page_source: email-addr (where alerts are sent from)
  page_destination: email-addr (where alerts are sent to)
  # can periodically send distinctive pings for various purposes
+ #distinctive_ping_len: [16-255]
  #distinctive_ping_ttl: [2-255]
  #distinctive_ping_tos: [tos value]
  #distinctive_ping_frequency: [2+] (minutes)
