@@ -95,6 +95,7 @@
 # 1.24 24 June 2026: Allow multiple ping IPs.
 # 1.25 30 June 2026: Fix bugs after Claude Opus 4.8 review.
 # 1.26 15 July 2026: Change route handling to add missing routes at start.
+# 1.27 28 July 2026: Add distinctive pinging features.
 
 # ToDo: Some former "constants" are now variables from the config and should
 # consider moving them to the variables section and making them all
@@ -119,7 +120,7 @@ use if $^O eq "openbsd", "OpenBSD::Unveil";
 
 ### Constants.
 
-my $VERSION = 'faild.pl 1.25 of 30 June 2026';
+my $VERSION = 'faild.pl 1.27 of 28 July 2026';
 
 # Pledge promise groups - stdio is added automatically by OpenBSD::Pledge
 my @READONLY_PROMISES     = ('rpath');
@@ -181,7 +182,31 @@ my %PING_NAME = (1, 'first',
 		 9, 'ninth',
 		 10, 'tenth');
 
-my (@GATEWAYS, @INTERFACES, @ROUTES, @PING_IPS, @GATE_TYPE);
+# Map of TOS keywords to their numeric TOS-byte value (0-255). OpenBSD's ping
+# accepts these keywords directly via -T, but Linux (-Q) and macOS (-z) only
+# accept a number, so we use this map to translate. The AF and CS values are
+# generated so the DSCP-to-byte arithmetic (DSCP << 2) can't be mistyped.
+my %KEYWORD_TOS = (
+    critical    => 0xa0, # 160, IPTOS_PREC_CRITIC_ECP
+    inetcontrol => 0xc0, # 192, IPTOS_PREC_INTERNETCONTROL
+    lowdelay    => 0x10, #  16, IPTOS_LOWDELAY
+    netcontrol  => 0xe0, # 224, IPTOS_PREC_NETCONTROL
+    throughput  => 0x08, #   8, IPTOS_THROUGHPUT
+    reliability => 0x04, #   4, IPTOS_RELIABILITY
+    ef          => 46 << 2, # 184, Expedited Forwarding (DSCP 46)
+    );
+# cs0..cs7: class selector, DSCP = idx*8, byte = DSCP << 2.
+foreach my $idx (0 .. 7) {
+    $KEYWORD_TOS{"cs$idx"} = ($idx * 8) << 2;
+}
+# af11..af43: DSCP = 8*class + 2*drop, byte = DSCP << 2.
+foreach my $class (1 .. 4) {
+    foreach my $drop (1 .. 3) {
+        $KEYWORD_TOS{"af$class$drop"} = ((8 * $class + 2 * $drop) << 2);
+    }
+}
+
+my (@GATEWAYS, @INTERFACES, @ROUTES, @PING_IPS, @GATE_TYPE, @DISTINCTIVE_PINGS);
 
 my $FAILD_CONF = '/etc/faild.conf';
 my $STATE_DIR = '/var/db'; # default
@@ -205,6 +230,8 @@ my ($PAGE_SOURCE, $PAGE_DESTINATION);
 my ($current_gateway, @current_state, @new_state, @state_time, @pings_down);
 my ($gate_type_name, $more_gateways_than_recorded);
 my (@last_interface_ip, @last_netmask, @last_gateway_ip);
+my ($distinctive_ping_ttl, $distinctive_ping_tos, $distinctive_ping_frequency);
+my $distinctive_pings_enabled = 0; # set true by parse_config if any host uses it
 my ($faild_uid, $faild_gid);
 my $helper_sock; # for privilege separation
 my $starting_up;
@@ -310,10 +337,21 @@ write_pid();
 
 initialize_routes();
 
+# distinctive_ping_frequency is in minutes. Starting at 0 makes the first
+# distinctive ping go out on the first cycle (handy for verifying the feature);
+# set this to time() instead to wait a full interval before the first one.
+my $last_distinctive_ping_time = 0;
+
 # Infinite loop.
 while (1) {
     ping_all_gateways();
     report_and_failover();
+
+    if ($distinctive_pings_enabled &&
+	time() - $last_distinctive_ping_time >= $distinctive_ping_frequency * 60) {
+	send_distinctive_pings();
+	$last_distinctive_ping_time = time();
+    }
 
     print "Sleeping for $SLEEP_TIME seconds.\n" if ($DEBUG);
     sleep $SLEEP_TIME;
@@ -326,7 +364,7 @@ exit;
 
 # Parse config file.
 sub parse_config {
-    my ($have_page_source, $have_page_destination, $gateway_idx, $have_interface, $have_routes, $have_ping_ip, $have_type);
+    my ($have_page_source, $have_page_destination, $gateway_idx, $have_interface, $have_routes, $have_ping_ip, $have_type, $have_distinctive_pings);
     $have_page_source = 0;
     $have_page_destination = 0;
     $gateway_idx = -1;
@@ -334,6 +372,7 @@ sub parse_config {
     $have_routes = 0;
     $have_ping_ip = 0;
     $have_type = 0;
+    $have_distinctive_pings = 0;
 
     die "Config file does not exist. $! $FAILD_CONF\n" if (!-e $FAILD_CONF);
     open (CONFIG, '<', $FAILD_CONF) || die "Cannot open config file for reading. $! $FAILD_CONF\n";
@@ -385,6 +424,31 @@ sub parse_config {
 		die "perform_failover must be \"yes\" or \"no\", not \"$1\".\n";
 	    }
 	}
+	elsif (/^\s*distinctive_ping_ttl:\s*(.*)$/) {
+	    if ($1 =~ /^\d+$/ &&
+		$1 > 1 && $1 <= 255) {
+		$distinctive_ping_ttl = $1;
+	    }
+	    else {
+		die "distinctive_ping_ttl must be a decimal number between 2 and 255, not \"$1\".\n";
+	    }
+	}
+	elsif (/^\s*distinctive_ping_tos:\s*(.*)$/) {
+	    if (valid_ping_tos ($1)) {
+		$distinctive_ping_tos = $1;
+	    }
+	    else {
+		die "distinctive_ping_tos must be a valid ping tos value, not \"$1\".\n";
+	    }
+	}
+	elsif (/^\s*distinctive_ping_frequency:\s*(.*)$/) {
+	    if ($1 =~ /^\d+$/ && $1 > 1) {
+		$distinctive_ping_frequency = $1;
+	    }
+	    else {
+		die "distinctive_ping_frequency must be a decimal number > 1, not \"$1\".\n";
+	    }
+	}
 	elsif (/^\s*gateway:\s*(.*)$/) {
 	    if ($gateway_idx > -1) {
 		die "New gateway line when no ping_ip specified for previous gateway. $_\n" if (!$have_ping_ip);
@@ -399,6 +463,7 @@ sub parse_config {
 		$have_routes = 0;
 		$have_ping_ip = 0;
 		$have_type = 0;
+		$have_distinctive_pings = 0;
 	    }
 	    else {
 		die "gateway must be an IPv4 address. $_\n";
@@ -470,6 +535,24 @@ sub parse_config {
 	    }
 	    $have_type = 1;
 	}
+	# Optional, only valid for type: host. Validated against type below,
+	# since type: may appear after this line for the same gateway.
+	elsif (/^\s*distinctive_pings:\s*(.*)$/) {
+	    die "distinctive_pings line before any gateway. $_\n" if ($gateway_idx < 0);
+	    if ($have_distinctive_pings) {
+		die "Already have distinctive_pings for gateway. $_\n";
+	    }
+	    if ($1 eq 'yes') {
+		$DISTINCTIVE_PINGS[$gateway_idx] = 1;
+	    }
+	    elsif ($1 eq 'no') {
+		$DISTINCTIVE_PINGS[$gateway_idx] = 0;
+	    }
+	    else {
+		die "distinctive_pings must be \"yes\" or \"no\", not \"$1\".\n";
+	    }
+	    $have_distinctive_pings = 1;
+	}
 	else {
 	    die "Unrecognized line in config. $_\n";
 	}
@@ -497,9 +580,30 @@ sub parse_config {
     if (!$have_type) {
 	die "Missing type in config. $FAILD_CONF\n";
     }
-    if ($have_routes && $GATE_TYPE[$gateway_idx] != $DEDICATED_DHCPLEASE_PRIMARY &&
-	$GATE_TYPE[$gateway_idx] != $DEDICATED_DHCPLEASE_BACKUP) {
-	die "Specific routes specified for non-dedicated DHCP gateway.\n";
+
+    # Per-gateway checks that can only run once every field of every gateway
+    # is known (type: may follow routes:/distinctive_pings: within a stanza,
+    # and these must be verified for every gateway, not just the last one).
+    for (my $idx = 0; $idx <= $#GATEWAYS; $idx++) {
+	if (defined ($ROUTES[$idx]) &&
+	    $GATE_TYPE[$idx] != $DEDICATED_DHCPLEASE_PRIMARY &&
+	    $GATE_TYPE[$idx] != $DEDICATED_DHCPLEASE_BACKUP) {
+	    die "Specific routes specified for non-dedicated DHCP gateway. ($GATEWAYS[$idx])\n";
+	}
+	if ($DISTINCTIVE_PINGS[$idx]) {
+	    $distinctive_pings_enabled = 1;
+	    if ($GATE_TYPE[$idx] != $HOST_CHECK) {
+		die "distinctive_pings is only valid for type: host. ($GATEWAYS[$idx])\n";
+	    }
+	}
+    }
+    if ($distinctive_pings_enabled) {
+	die "distinctive_pings requires distinctive_ping_frequency in config. $FAILD_CONF\n"
+	    unless (defined ($distinctive_ping_frequency));
+	# A ping with neither a distinctive TTL nor TOS is not distinguishable
+	# from an ordinary echo request, so require at least one.
+	die "distinctive_pings requires distinctive_ping_ttl and/or distinctive_ping_tos in config. $FAILD_CONF\n"
+	    unless (defined ($distinctive_ping_ttl) || defined ($distinctive_ping_tos));
     }
 }
 
@@ -543,6 +647,69 @@ sub is_interface {
     return 0 unless ($if =~ /^[a-z]+\d+(\.\d+)?$/);
     return 0 if (length ($if) >= 16);
     return 1;
+    }
+
+# Subroutine to validate ping TOS values.
+sub valid_ping_tos {
+    my ($tos) = @_;
+    return 0 unless (defined ($tos));
+
+    # Named keyword: critical, lowdelay, ef, af11..af43, cs0..cs7, etc.
+    return 1 if (exists ($KEYWORD_TOS{$tos}));
+
+    # Otherwise a numeric TOS byte, hex (0x..) or decimal, in range 0..255.
+    my $tos_num;
+    if ($tos =~ /^0[xX][0-9a-fA-F]+$/) {
+	$tos_num = hex ($tos);
+    }
+    elsif ($tos =~ /^\d+$/) {
+	$tos_num = $tos + 0;
+    }
+    else {
+	return 0;
+    }
+    return ($tos_num >= 0 && $tos_num <= 255) ? 1 : 0;
+}
+
+# Convert a TOS keyword or numeric string to its decimal byte value (0-255).
+# OpenBSD's ping understands the keywords natively, but Linux (-Q) and macOS
+# (-z) need a number. Assumes the value already passed valid_ping_tos().
+sub tos_to_number {
+    my ($tos) = @_;
+    return $KEYWORD_TOS{$tos} if (exists ($KEYWORD_TOS{$tos}));
+    return hex ($tos) if ($tos =~ /^0[xX]/);
+    return $tos + 0;
+}
+
+# Build the ping argument list for the host OS. The TTL flag, TOS flag, and
+# overall-timeout flag all differ between ping implementations:
+#
+#              TTL   TOS   timeout
+#   OpenBSD    -t    -T    -w (seconds)
+#   Linux      -t    -Q    -w (seconds)   (-T is a timestamp option here!)
+#   macOS      -m    -z    -t (seconds)   (-t is the timeout, not TTL; no -w)
+#
+# TOS keywords are OpenBSD-only, so we pass a number on the other platforms.
+sub build_ping_opts {
+    my ($timeout, $ttl, $tos) = @_;
+    my @opts = ('-c', '1', '-q');
+
+    if ($^O eq 'darwin') {
+	push (@opts, '-t', $timeout);              # macOS: -t is the timeout
+	push (@opts, '-m', $ttl) if (defined ($ttl));
+	push (@opts, '-z', tos_to_number ($tos)) if (defined ($tos));
+    }
+    elsif ($^O eq 'linux') {
+	push (@opts, '-w', $timeout);
+	push (@opts, '-t', $ttl) if (defined ($ttl));
+	push (@opts, '-Q', tos_to_number ($tos)) if (defined ($tos));
+    }
+    else { # openbsd and other BSDs
+	push (@opts, '-w', $timeout);
+	push (@opts, '-t', $ttl) if (defined ($ttl));
+	push (@opts, '-T', $tos) if (defined ($tos)); # keyword passed through
+    }
+    return @opts;
 }
 
 # Subroutine to check format of specific routes list. IPv4 only.
@@ -1571,12 +1738,42 @@ sub ping_gateway_ips {
     return 0;
 }
 
+# Send distinctive pings to any host-type entries configured for them. These
+# carry a distinctive TTL and/or TOS so the remote host can log them separately
+# from ordinary ICMP echo requests. They are purely for remote-side logging and
+# deliberately do not affect up/down state, so the ping result is ignored.
+sub send_distinctive_pings {
+    my ($idx, $ip);
+
+    print "Entering sub send_distinctive_pings.\n" if ($DEBUG);
+    for ($idx = 0; $idx <= $#GATEWAYS; $idx++) {
+	next unless ($GATE_TYPE[$idx] == $HOST_CHECK);
+	next unless ($DISTINCTIVE_PINGS[$idx]);
+	next unless (defined ($PING_IPS[$idx]));
+	foreach $ip (@{$PING_IPS[$idx]}) {
+	    ping_host ($ip, $PING_TIMEOUT,
+		       $distinctive_ping_ttl, $distinctive_ping_tos);
+	    if ($DEBUG) {
+		my $ttl = defined ($distinctive_ping_ttl) ? $distinctive_ping_ttl : 'default';
+		my $tos = defined ($distinctive_ping_tos) ? $distinctive_ping_tos : 'default';
+		print "Sent distinctive ping (ttl=$ttl, tos=$tos) to $ip.\n";
+	    }
+	}
+    }
+}
+
 # Ping gateways or hosts.
 # Send a single ICMP ping using /sbin/ping. Returns 1 on success, 0 on failure.
 # This replaces Net::Ping which requires raw sockets (root privileges).
 sub ping_host {
-    my ($ip, $timeout) = @_;
+    my ($ip, $timeout, $ttl, $tos) = @_;
     $timeout //= 1;
+
+    return 0 unless (!defined ($ttl) || ($ttl =~ /^\d+$/ &&
+					 $ttl > 1 &&
+					 $ttl <= 255));
+
+    return 0 unless (!defined ($tos) || valid_ping_tos ($tos));
     
     # Validate IP before passing to system command (defense in depth)
     return 0 unless ($ip =~ /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/);
@@ -1593,7 +1790,8 @@ sub ping_host {
         POSIX::dup2 (fileno($devnull), 1);
         POSIX::dup2 (fileno($devnull), 2);	
 	close ($devnull);
-        exec ($PING, '-c', '1', '-w', $timeout, '-q', $ip);
+	my @ping_opts = build_ping_opts ($timeout, $ttl, $tos);
+        exec ($PING, @ping_opts, $ip);
         exit (1);  # only reached if exec fails
     }
     # Parent: wait for ping to complete
