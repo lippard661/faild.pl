@@ -230,7 +230,8 @@ my ($PAGE_SOURCE, $PAGE_DESTINATION);
 my ($current_gateway, @current_state, @new_state, @state_time, @pings_down);
 my ($gate_type_name, $more_gateways_than_recorded);
 my (@last_interface_ip, @last_netmask, @last_gateway_ip);
-my ($distinctive_ping_ttl, $distinctive_ping_tos, $distinctive_ping_frequency);
+my ($distinctive_ping_len, $distinctive_ping_ttl, $distinctive_ping_tos,
+    $distinctive_ping_frequency);
 my $distinctive_pings_enabled = 0; # set true by parse_config if any host uses it
 my ($faild_uid, $faild_gid);
 my $helper_sock; # for privilege separation
@@ -424,6 +425,16 @@ sub parse_config {
 		die "perform_failover must be \"yes\" or \"no\", not \"$1\".\n";
 	    }
 	}
+	elsif (/^\s*distinctive_ping_len:\s*(.*)$/) {
+	    my $val = $1;
+	    if ($val =~ /^\d+$/ &&
+		$val >= 16 && $val <= 255) {
+		$distinctive_ping_len = $val;
+	    }
+	    else {
+		die "distinctive_ping_len must be a decimal number between 16 and 255 bytes, not \"$val\".\n";
+	    }
+	}
 	elsif (/^\s*distinctive_ping_ttl:\s*(.*)$/) {
 	    my $val = $1;
 	    if ($val =~ /^\d+$/ &&
@@ -431,7 +442,7 @@ sub parse_config {
 		$distinctive_ping_ttl = $val;
 	    }
 	    else {
-		die "distinctive_ping_ttl must be a decimal number between 2 and 255, not \"$1\".\n";
+		die "distinctive_ping_ttl must be a decimal number between 2 and 255, not \"$val\".\n";
 	    }
 	}
 	elsif (/^\s*distinctive_ping_tos:\s*(.*)$/) {
@@ -448,7 +459,7 @@ sub parse_config {
 		$distinctive_ping_frequency = $val;
 	    }
 	    else {
-		die "distinctive_ping_frequency must be a decimal number > 1, not \"$1\".\n";
+		die "distinctive_ping_frequency must be a decimal number > 1, not \"$val\".\n";
 	    }
 	}
 	elsif (/^\s*gateway:\s*(.*)$/) {
@@ -604,8 +615,8 @@ sub parse_config {
 	    unless (defined ($distinctive_ping_frequency));
 	# A ping with neither a distinctive TTL nor TOS is not distinguishable
 	# from an ordinary echo request, so require at least one.
-	die "distinctive_pings requires distinctive_ping_ttl and/or distinctive_ping_tos in config. $FAILD_CONF\n"
-	    unless (defined ($distinctive_ping_ttl) || defined ($distinctive_ping_tos));
+	die "distinctive_pings requires distinctive_ping_len, distinctive_ping_ttl, and/or distinctive_ping_tos in config. $FAILD_CONF\n"
+	    unless (defined ($distinctive_ping_len) || defined ($distinctive_ping_ttl) || defined ($distinctive_ping_tos));
     }
 }
 
@@ -693,8 +704,10 @@ sub tos_to_number {
 #
 # TOS keywords are OpenBSD-only, so we pass a number on the other platforms.
 sub build_ping_opts {
-    my ($timeout, $ttl, $tos) = @_;
+    my ($timeout, $len, $ttl, $tos) = @_;
     my @opts = ('-c', '1', '-q');
+
+    push (@opts, '-s', $len) if (defined ($len)); # option same for each OS
 
     if ($^O eq 'darwin') {
 	push (@opts, '-t', $timeout);              # macOS: -t is the timeout
@@ -1753,12 +1766,13 @@ sub send_distinctive_pings {
 	next unless ($DISTINCTIVE_PINGS[$idx]);
 	next unless (defined ($PING_IPS[$idx]));
 	foreach $ip (@{$PING_IPS[$idx]}) {
-	    ping_host ($ip, $PING_TIMEOUT,
+	    ping_host ($ip, $PING_TIMEOUT, $distinctive_ping_len,
 		       $distinctive_ping_ttl, $distinctive_ping_tos);
 	    if ($DEBUG) {
+		my $len = defined ($distinctive_ping_len) ? $distinctive_ping_len : 'default';
 		my $ttl = defined ($distinctive_ping_ttl) ? $distinctive_ping_ttl : 'default';
 		my $tos = defined ($distinctive_ping_tos) ? $distinctive_ping_tos : 'default';
-		print "Sent distinctive ping (ttl=$ttl, tos=$tos) to $ip.\n";
+		print "Sent distinctive ping (len=$len, ttl=$ttl, tos=$tos) to $ip.\n";
 	    }
 	}
     }
@@ -1768,8 +1782,11 @@ sub send_distinctive_pings {
 # Send a single ICMP ping using /sbin/ping. Returns 1 on success, 0 on failure.
 # This replaces Net::Ping which requires raw sockets (root privileges).
 sub ping_host {
-    my ($ip, $timeout, $ttl, $tos) = @_;
+    my ($ip, $timeout, $len, $ttl, $tos) = @_;
     $timeout //= 1;
+
+    return 0 unless (!defined ($len) || ($len =~ /^\d+$/ &&
+					 $len >= 16 && $len <= 255));
 
     return 0 unless (!defined ($ttl) || ($ttl =~ /^\d+$/ &&
 					 $ttl > 1 &&
@@ -1792,7 +1809,7 @@ sub ping_host {
         POSIX::dup2 (fileno($devnull), 1);
         POSIX::dup2 (fileno($devnull), 2);	
 	close ($devnull);
-	my @ping_opts = build_ping_opts ($timeout, $ttl, $tos);
+	my @ping_opts = build_ping_opts ($timeout, $len, $ttl, $tos);
         exec ($PING, @ping_opts, $ip);
         exit (1);  # only reached if exec fails
     }
