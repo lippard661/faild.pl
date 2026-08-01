@@ -96,6 +96,7 @@
 # 1.25 30 June 2026: Fix bugs after Claude Opus 4.8 review.
 # 1.26 15 July 2026: Change route handling to add missing routes at start.
 # 1.27 28 July 2026: Add distinctive pinging features.
+# 1.28 31 July 2026: Add name, gateway_table, dynamic_dping_table.
 
 # ToDo: Some former "constants" are now variables from the config and should
 # consider moving them to the variables section and making them all
@@ -120,7 +121,7 @@ use if $^O eq "openbsd", "OpenBSD::Unveil";
 
 ### Constants.
 
-my $VERSION = 'faild.pl 1.27 of 28 July 2026';
+my $VERSION = 'faild.pl 1.28 of 31 July 2026';
 
 # Pledge promise groups - stdio is added automatically by OpenBSD::Pledge
 my @READONLY_PROMISES     = ('rpath');
@@ -207,6 +208,11 @@ foreach my $class (1 .. 4) {
 }
 
 my (@GATEWAYS, @INTERFACES, @ROUTES, @PING_IPS, @GATE_TYPE, @DISTINCTIVE_PINGS);
+my (@NAMES, @GATEWAY_TABLE, @DYNAMIC_DPING_TABLE);
+# Whitelist of pf table names faild is allowed to manage, built in parse_config
+# (which runs as root before the privsep fork), so the privileged helper can
+# screen table-op requests against it independently of the monitor side.
+my %MANAGED_TABLES;
 
 my $FAILD_CONF = '/etc/faild.conf';
 my $STATE_DIR = '/var/db'; # default
@@ -347,6 +353,7 @@ my $last_distinctive_ping_time = 0;
 while (1) {
     ping_all_gateways();
     report_and_failover();
+    sync_managed_tables();
 
     if ($distinctive_pings_enabled &&
 	time() - $last_distinctive_ping_time >= $distinctive_ping_frequency * 60) {
@@ -366,6 +373,10 @@ exit;
 # Parse config file.
 sub parse_config {
     my ($have_page_source, $have_page_destination, $gateway_idx, $have_interface, $have_routes, $have_ping_ip, $have_type, $have_distinctive_pings);
+    my ($have_name, $have_gateway_table, $have_dynamic_dping_table);
+    $have_name = 0;
+    $have_gateway_table = 0;
+    $have_dynamic_dping_table = 0;
     $have_page_source = 0;
     $have_page_destination = 0;
     $gateway_idx = -1;
@@ -477,6 +488,9 @@ sub parse_config {
 		$have_ping_ip = 0;
 		$have_type = 0;
 		$have_distinctive_pings = 0;
+		$have_name = 0;
+		$have_gateway_table = 0;
+		$have_dynamic_dping_table = 0;
 	    }
 	    else {
 		die "gateway must be an IPv4 address. $_\n";
@@ -566,6 +580,38 @@ sub parse_config {
 	    }
 	    $have_distinctive_pings = 1;
 	}
+	# Optional descriptive label for any entry, inserted into alerts.
+	elsif (/^\s*name:\s*(.*)$/) {
+	    die "name line before any gateway. $_\n" if ($gateway_idx < 0);
+	    die "Already have a name for gateway. $_\n" if ($have_name);
+	    my $val = $1;
+	    $val =~ s/\s+$//;
+	    die "name must be non-empty. $_\n" if ($val eq '');
+	    $NAMES[$gateway_idx] = $val;
+	    $have_name = 1;
+	}
+	# Optional pf table faild keeps populated with this gateway's current
+	# next-hop, for use as a route-to target. Validated against type below.
+	elsif (/^\s*gateway_table:\s*(.*)$/) {
+	    die "gateway_table line before any gateway. $_\n" if ($gateway_idx < 0);
+	    die "Already have a gateway_table for gateway. $_\n" if ($have_gateway_table);
+	    my $val = $1;
+	    $val =~ s/\s+$//;
+	    die "Invalid pf table name \"$val\". $_\n" unless (is_pftable_name ($val));
+	    $GATEWAY_TABLE[$gateway_idx] = $val;
+	    $have_gateway_table = 1;
+	}
+	# Optional pf table faild populates with distinctive-ping host IPs while
+	# this (backup) gateway is up and flushes when it is down. Validated below.
+	elsif (/^\s*dynamic_dping_table:\s*(.*)$/) {
+	    die "dynamic_dping_table line before any gateway. $_\n" if ($gateway_idx < 0);
+	    die "Already have a dynamic_dping_table for gateway. $_\n" if ($have_dynamic_dping_table);
+	    my $val = $1;
+	    $val =~ s/\s+$//;
+	    die "Invalid pf table name \"$val\". $_\n" unless (is_pftable_name ($val));
+	    $DYNAMIC_DPING_TABLE[$gateway_idx] = $val;
+	    $have_dynamic_dping_table = 1;
+	}
 	else {
 	    die "Unrecognized line in config. $_\n";
 	}
@@ -607,6 +653,49 @@ sub parse_config {
 	    $distinctive_pings_enabled = 1;
 	    if ($GATE_TYPE[$idx] != $HOST_CHECK) {
 		die "distinctive_pings is only valid for type: host. ($GATEWAYS[$idx])\n";
+	    }
+	}
+	# gateway_table holds a gateway's next-hop; a host has none.
+	if (defined ($GATEWAY_TABLE[$idx])) {
+	    if ($GATE_TYPE[$idx] == $HOST_CHECK) {
+		die "gateway_table is not valid for type: host. ($GATEWAYS[$idx])\n";
+	    }
+	    if ($MANAGED_TABLES{$GATEWAY_TABLE[$idx]}) {
+		die "pf table \"$GATEWAY_TABLE[$idx]\" is managed by more than one entry.\n";
+	    }
+	    $MANAGED_TABLES{$GATEWAY_TABLE[$idx]} = 1;
+	}
+	# dynamic_dping_table gates distinctive pings onto a backup gateway.
+	if (defined ($DYNAMIC_DPING_TABLE[$idx])) {
+	    if ($GATE_TYPE[$idx] != $DEDICATED_DHCPLEASE_BACKUP) {
+		die "dynamic_dping_table is only valid for a dedicated-dhcplease-backup gateway. ($GATEWAYS[$idx])\n";
+	    }
+	    if ($MANAGED_TABLES{$DYNAMIC_DPING_TABLE[$idx]}) {
+		die "pf table \"$DYNAMIC_DPING_TABLE[$idx]\" is managed by more than one entry.\n";
+	    }
+	    $MANAGED_TABLES{$DYNAMIC_DPING_TABLE[$idx]} = 1;
+	}
+    }
+
+    # A dynamic_dping_table is only meaningful if some host actually sends
+    # distinctive pings; otherwise it would forever be empty.
+    if (grep { defined } @DYNAMIC_DPING_TABLE) {
+	die "dynamic_dping_table requires at least one host with distinctive_pings: yes. $FAILD_CONF\n"
+	    unless ($distinctive_pings_enabled);
+    }
+
+    # Enforce the "never route a gateway health-check probe" rule: no IP that
+    # will populate a dynamic_dping_table (a distinctive-ping host's ping_ip)
+    # may also be a gateway's ping target, or a gateway-down flush would divert
+    # the very probe used to decide that gateway is up.
+    if (grep { defined } @DYNAMIC_DPING_TABLE) {
+	my %dping_ip = map { $_ => 1 } distinctive_ping_host_ips();
+	for (my $idx = 0; $idx <= $#GATEWAYS; $idx++) {
+	    next if ($GATE_TYPE[$idx] == $HOST_CHECK);
+	    next unless (defined ($PING_IPS[$idx]));
+	    foreach my $ip (@{$PING_IPS[$idx]}) {
+		die "ping_ip $ip is both a gateway probe and a distinctive-ping " .
+		    "destination; these must be disjoint.\n" if ($dping_ip{$ip});
 	    }
 	}
     }
@@ -661,6 +750,18 @@ sub is_interface {
     return 0 if (length ($if) >= 16);
     return 1;
     }
+
+# Subroutine to validate a pf table name. pf table names are limited to
+# printable non-whitespace; we restrict further to a safe, conventional set
+# and forbid the leading characters pfctl treats specially. This is belt and
+# suspenders: managed table names are also whitelisted from the parsed config.
+sub is_pftable_name {
+    my ($name) = @_;
+    return 0 unless defined ($name);
+    return 0 if (length ($name) < 1 || length ($name) > 31);
+    return 0 unless ($name =~ /^[A-Za-z0-9][A-Za-z0-9_.:-]*$/);
+    return 1;
+}
 
 # Subroutine to validate ping TOS values.
 sub valid_ping_tos {
@@ -755,6 +856,8 @@ sub determine_privilege_mode {
             }
         }
     }
+    # Managing pf tables requires the privileged helper (pfctl needs root).
+    $need_helper = 1 if (%MANAGED_TABLES);
 
     # Validate we have the privileges and users we need.
     if ($need_helper && !$running_as_root) {
@@ -881,6 +984,25 @@ sub dispatch_command {
         return {status => 'err', reason => 'bad ip'} 
             unless (defined ($req->{ip}) && is_ipaddr ($req->{ip}));
         return run_helper_cmd ($PFCTL, '-F', 'states', '-k', $req->{ip});
+    }
+    elsif ($cmd eq 'PFCTL_TABLE_REPLACE') {
+        # Table name must be one faild declared in its config (parsed as root
+        # before the privsep fork), so a compromised monitor cannot touch any
+        # other table. An empty address set flushes the table.
+        return {status => 'err', reason => 'bad table'}
+            unless (defined ($req->{table}) && $MANAGED_TABLES{$req->{table}});
+        my $ips = $req->{ips};
+        return {status => 'err', reason => 'bad ips'}
+            unless (defined ($ips) && ref ($ips) eq 'ARRAY');
+        foreach my $ip (@$ips) {
+            return {status => 'err', reason => 'bad ip'} unless (is_ipaddr ($ip));
+        }
+        if (@$ips) {
+            return run_helper_cmd ($PFCTL, '-t', $req->{table}, '-T', 'replace', @$ips);
+        }
+        else {
+            return run_helper_cmd ($PFCTL, '-t', $req->{table}, '-T', 'flush');
+        }
     }
     elsif ($cmd eq 'DHCPLEASECTL_RENEW') {
         return {status => 'err', reason => 'bad interface'} 
@@ -1218,13 +1340,14 @@ sub ping_all_gateways {
 
     for ($idx = 0; $idx <= $#GATEWAYS; $idx++) {
 	$gate_type_name = $GATE_TYPE_NAME[$GATE_TYPE[$idx]];
+	my $glabel = gate_label ($idx);
 	if (ping_gateway_ips ($idx, $PING_TIMEOUT)) {
 	    $new_state[$idx] = $UP;
-	    print "$gate_type_name $idx ($GATEWAYS[$idx]) is up on the first ping.\n" if ($DEBUG);
+	    print "$glabel is up on the first ping.\n" if ($DEBUG);
 	}
 	else {
 	    $new_state[$idx] = $DOWN;
-	    print "$gate_type_name $idx ($GATEWAYS[$idx]) is down on the first ping.\n" if ($DEBUG);
+	    print "$glabel is down on the first ping.\n" if ($DEBUG);
 	    $pings_down[$idx] = 1;
 	}
     }
@@ -1233,18 +1356,19 @@ sub ping_all_gateways {
     # including the first)
     for ($idx = 0; $idx <= $#GATEWAYS; $idx++) {
 	$gate_type_name = $GATE_TYPE_NAME[$GATE_TYPE[$idx]];
+	my $glabel = gate_label ($idx);
 	if ($new_state[$idx] == $DOWN) {
 	    for ($n_pings = 2; $n_pings < $N_PINGS_DOWN+1; $n_pings++) {
 		if (ping_gateway_ips ($idx, $PING_TIMEOUT)) {
 		    $new_state[$idx] = $UP;
 		    $pings_down[$idx] = 0; # prevent miscount if it goes down in next minute
-		    print "$gate_type_name $idx ($GATEWAYS[$idx]) is up on the $PING_NAME{$n_pings} ping.\n" if ($DEBUG);
-		    logmsg ('alert', "$gate_type_name $idx ($GATEWAYS[$idx]) is up on the $PING_NAME{$n_pings} ping.") if ($n_pings > $N_PINGS_TO_NOTIFY);
+		    print "$glabel is up on the $PING_NAME{$n_pings} ping.\n" if ($DEBUG);
+		    logmsg ('alert', "$glabel is up on the $PING_NAME{$n_pings} ping.") if ($n_pings > $N_PINGS_TO_NOTIFY);
 		    last;
 		}
 		else {
-		    print "$gate_type_name $idx ($GATEWAYS[$idx]) is down on the $PING_NAME{$n_pings} ping.\n" if ($DEBUG);
-		    logmsg ('alert', "$gate_type_name $idx ($GATEWAYS[$idx]) is down on the $PING_NAME{$n_pings} ping.") if ($n_pings > $N_PINGS_TO_NOTIFY);
+		    print "$glabel is down on the $PING_NAME{$n_pings} ping.\n" if ($DEBUG);
+		    logmsg ('alert', "$glabel is down on the $PING_NAME{$n_pings} ping.") if ($n_pings > $N_PINGS_TO_NOTIFY);
 		    $pings_down[$idx] = $n_pings;
 		}
 	    }
@@ -1279,6 +1403,7 @@ sub report_and_failover {
     for (my $idx = 0; $idx <= $#GATEWAYS; $idx++) {
 	my ($interface_ip, $netmask, $gateway_ip, $lease_time, $units);
 	$gate_type_name = $GATE_TYPE_NAME[$GATE_TYPE[$idx]];
+	my $glabel = gate_label ($idx);
 
 	# Check DHCP lease info for changes and expiring leases.
 	if (($GATE_TYPE[$idx] == $DEDICATED_DHCPLEASE_PRIMARY
@@ -1382,11 +1507,11 @@ sub report_and_failover {
 	    $plural = 's';
 	    $plural = '' if ($duration == 1);
 	    if ($new_state[$idx] == $UP) {
-		logmsg ('alert', "$gate_type_name $idx ($GATEWAYS[$idx]) is again reachable (down $duration minute$plural), $pings_down[$idx] failed pings.");
+		logmsg ('alert', "$glabel is again reachable (down $duration minute$plural), $pings_down[$idx] failed pings.");
 		$pings_down[$idx] = 0; # reset counter
-		print "$gate_type_name $idx ($GATEWAYS[$idx]) is again reachable (down $duration minute$plural).\n" if ($DEBUG);
+		print "$glabel is again reachable (down $duration minute$plural).\n" if ($DEBUG);
 		if ($duration > 15) {
-		    send_page ("faild.pl: $gate_type_name $idx ($GATEWAYS[$idx]) is again reachable (down $duration minute$plural).");
+		    send_page ("faild.pl: $glabel is again reachable (down $duration minute$plural).");
 		}
 		# A newly up gateway that we may or may not be switching to,
 		# depending on whether multiple were down.  We may end up
@@ -1407,8 +1532,8 @@ sub report_and_failover {
 		}
 	    }
 	    else {
-		logmsg ('alert', "$gate_type_name $idx ($GATEWAYS[$idx]) has gone down (up $duration minute$plural).");
-		print "$gate_type_name $idx ($GATEWAYS[$idx]) has gone down (up $duration minute$plural).\n" if ($DEBUG);
+		logmsg ('alert', "$glabel has gone down (up $duration minute$plural).");
+		print "$glabel has gone down (up $duration minute$plural).\n" if ($DEBUG);
 	    }
 	    $current_state[$idx] = $new_state[$idx];
 	    $state_time[$idx] = time();
@@ -1418,10 +1543,10 @@ sub report_and_failover {
 	    $duration = int ($duration / 60);
 	    $plural = 's';
 	    $plural = '' if ($duration == 1);
-	    logmsg ('alert', "$gate_type_name $idx ($GATEWAYS[$idx]) has been down for $duration minute$plural.");
-	    print "$gate_type_name $idx ($GATEWAYS[$idx]) has been down for $duration minute$plural.\n" if ($DEBUG);
+	    logmsg ('alert', "$glabel has been down for $duration minute$plural.");
+	    print "$glabel has been down for $duration minute$plural.\n" if ($DEBUG);
 	    if ($duration % 15 == 0 && $duration < 61) {
-		send_page ("faild.pl: $gate_type_name $idx ($GATEWAYS[$idx]) has been down for $duration minutes.");
+		send_page ("faild.pl: $glabel has been down for $duration minutes.");
 	    }
 	    # Add permanent routes if missing while down -- necessary to make
 	    # sure test pings still go out the right interface.
@@ -1484,20 +1609,20 @@ sub report_and_failover {
 	    # doing it.
 	    elsif ($new_state[$idx] == $UP && $GATE_TYPE[$idx] != $HOST_CHECK) {
 		if ($idx < $current_gateway) {
-		    logmsg ('alert', "Failing back from gateway $current_gateway ($GATEWAYS[$current_gateway]) to gateway $idx ($GATEWAYS[$idx]).");
-		    print "Failing back from gateway $current_gateway ($GATEWAYS[$current_gateway]) to gateway $idx ($GATEWAYS[$idx]).\n" if ($DEBUG);
-		    send_page ("faild.pl: Failing back from gateway $current_gateway ($GATEWAYS[$current_gateway]) to gateway $idx ($GATEWAYS[$idx]).");
+		    logmsg ('alert', "Failing back from gateway $current_gateway ${\ gname($current_gateway)} to gateway $idx ${\ gname($idx)}.");
+		    print "Failing back from gateway $current_gateway ${\ gname($current_gateway)} to gateway $idx ${\ gname($idx)}.\n" if ($DEBUG);
+		    send_page ("faild.pl: Failing back from gateway $current_gateway ${\ gname($current_gateway)} to gateway $idx ${\ gname($idx)}.");
 		    $current_gateway = $idx;
 		}
 		elsif ($idx > $current_gateway) {
 		    if ($starting_up) {
-			logmsg ('alert', "Starting up with gateway $idx ($GATEWAYS[$idx]).");
-			print "Starting up with gateway $idx ($GATEWAYS[$idx]).\n";
+			logmsg ('alert', "Starting up with gateway $idx ${\ gname($idx)}.");
+			print "Starting up with gateway $idx ${\ gname($idx)}.\n";
 		    }
 		    else {
-			logmsg ('alert', "Failing over from gateway $current_gateway ($GATEWAYS[$current_gateway]) to gateway $idx ($GATEWAYS[$idx]).");
-			print "Failing over from gateway $current_gateway ($GATEWAYS[$current_gateway]) to gateway $idx ($GATEWAYS[$idx]).\n" if ($DEBUG);
-			send_page ("faild.pl: Failing over from gateway $current_gateway ($GATEWAYS[$current_gateway]) to gateway $idx ($GATEWAYS[$idx]).");
+			logmsg ('alert', "Failing over from gateway $current_gateway ${\ gname($current_gateway)} to gateway $idx ${\ gname($idx)}.");
+			print "Failing over from gateway $current_gateway ${\ gname($current_gateway)} to gateway $idx ${\ gname($idx)}.\n" if ($DEBUG);
+			send_page ("faild.pl: Failing over from gateway $current_gateway ${\ gname($current_gateway)} to gateway $idx ${\ gname($idx)}.");
 		    }
 		    $current_gateway = $idx;
 		}
@@ -1708,6 +1833,25 @@ sub route_present {
 }
 
 # Log a message to syslog.
+# Format an entry's identity for alerts: "TypeName idx name (IP)" when a name
+# is configured, else "TypeName idx (IP)". Emitting the stable name lets
+# downstream alert processing (e.g. reportnew) key on it rather than on a
+# changeable IP.
+sub gate_label {
+    my ($idx) = @_;
+    my $id = "$GATE_TYPE_NAME[$GATE_TYPE[$idx]] $idx";
+    $id .= " $NAMES[$idx]" if (defined ($NAMES[$idx]));
+    return "$id ($GATEWAYS[$idx])";
+}
+
+# Short identity for failover messages that name two gateways at once:
+# "name (IP)" or "(IP)".
+sub gname {
+    my ($idx) = @_;
+    return defined ($NAMES[$idx]) ? "$NAMES[$idx] ($GATEWAYS[$idx])"
+	                          : "($GATEWAYS[$idx])";
+}
+
 sub logmsg {
     my ($level, $msg) = @_;
 
@@ -1753,6 +1897,20 @@ sub ping_gateway_ips {
     return 0;
 }
 
+# Return the ping_ip destinations of every host entry configured to receive
+# distinctive pings. Used to populate a dynamic_dping_table and, at parse time,
+# to guarantee those destinations never overlap a gateway's health probe.
+sub distinctive_ping_host_ips {
+    my @ips;
+    for (my $idx = 0; $idx <= $#GATEWAYS; $idx++) {
+	next unless ($GATE_TYPE[$idx] == $HOST_CHECK);
+	next unless ($DISTINCTIVE_PINGS[$idx]);
+	next unless (defined ($PING_IPS[$idx]));
+	push @ips, @{$PING_IPS[$idx]};
+    }
+    return @ips;
+}
+
 # Send distinctive pings to any host-type entries configured for them. These
 # carry a distinctive TTL and/or TOS so the remote host can log them separately
 # from ordinary ICMP echo requests. They are purely for remote-side logging and
@@ -1776,6 +1934,51 @@ sub send_distinctive_pings {
 	    }
 	}
     }
+}
+
+# Reconcile every faild-managed pf table to the current gateway state. Called
+# each cycle after report_and_failover. The pf 'replace' primitive is idempotent
+# (pfctl computes the add/delete diff itself), so this both applies changes and
+# self-heals drift or a stale table left by a restart -- the same reconcile-to-
+# desired-state approach used for cold start elsewhere.
+#
+# A gateway_table tracks an address fact (the current next-hop) and is not gated
+# on up/down. A dynamic_dping_table is gated on the gateway's state: populated
+# with the distinctive-ping host IPs while up, flushed while down (so the pf
+# route-to rule keyed on it stops matching and those pings fall to the default
+# path -- the positive Cox-down signal the remote monitor reads).
+sub sync_managed_tables {
+    return unless (%MANAGED_TABLES);
+    print "Entering sub sync_managed_tables.\n" if ($DEBUG);
+
+    my (@dping_ips, $have_dping_ips);
+    $have_dping_ips = 0;
+
+    for (my $idx = 0; $idx <= $#GATEWAYS; $idx++) {
+	if (defined ($GATEWAY_TABLE[$idx])) {
+	    # Prefer the dhcplease-learned next-hop; fall back to the configured
+	    # gateway IP for a static gateway.
+	    my @want = defined ($last_gateway_ip[$idx]) ? ($last_gateway_ip[$idx])
+		     : is_ipaddr ($GATEWAYS[$idx])       ? ($GATEWAYS[$idx])
+		     :                                     ();
+	    replace_managed_table ($GATEWAY_TABLE[$idx], @want);
+	}
+	if (defined ($DYNAMIC_DPING_TABLE[$idx])) {
+	    if (!$have_dping_ips) {
+		@dping_ips = distinctive_ping_host_ips();
+		$have_dping_ips = 1;
+	    }
+	    my @want = ($current_state[$idx] == $UP) ? @dping_ips : ();
+	    replace_managed_table ($DYNAMIC_DPING_TABLE[$idx], @want);
+	}
+    }
+}
+
+# Push an exact membership to a managed pf table (flushes if the set is empty).
+sub replace_managed_table {
+    my ($table, @ips) = @_;
+    helper_cmd ("replace pf table $table", 1,
+		cmd => 'PFCTL_TABLE_REPLACE', table => $table, ips => [@ips]);
 }
 
 # Ping gateways or hosts.
