@@ -1,9 +1,10 @@
 # faild.pl
-Script to monitor Internet connections and remote hosts for uptime and generate alerts when they go down. Also can make routing changes to facilitate failover.
+Script to monitor Internet connections and remote hosts for uptime and generate alerts when they go down.
+Also can make routing changes and pf table changes to facilitate failover.
 
 Also found at https://www.discord.org/lippard/software/
 
-faild.pl 1.28 of 31 July 2026
+faild.pl 1.29 of 1 August 2026
 
 1.20 does privilege separation.
 1.19 replaces Net::Ping with system call to ping as preparation

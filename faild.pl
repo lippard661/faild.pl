@@ -97,6 +97,8 @@
 # 1.26 15 July 2026: Change route handling to add missing routes at start.
 # 1.27 28 July 2026: Add distinctive pinging features.
 # 1.28 31 July 2026: Add name, gateway_table, dynamic_dping_table.
+# 1.29 1 August 2026: Update error message when run as non-privileged
+#    when pf table integration is used and add table existence check.
 
 # ToDo: Some former "constants" are now variables from the config and should
 # consider moving them to the variables section and making them all
@@ -121,7 +123,7 @@ use if $^O eq "openbsd", "OpenBSD::Unveil";
 
 ### Constants.
 
-my $VERSION = 'faild.pl 1.28 of 31 July 2026';
+my $VERSION = 'faild.pl 1.29 of 1 August 2026';
 
 # Pledge promise groups - stdio is added automatically by OpenBSD::Pledge
 my @READONLY_PROMISES     = ('rpath');
@@ -290,6 +292,14 @@ if ($PERFORM_FAILOVER && $^O ne 'openbsd') {
 }
 
 my ($running_as_root, $need_helper) = determine_privilege_mode();
+
+# Verify declared managed pf tables exist before we daemonize and drop
+# privileges. At this point we are guaranteed root (determine_privilege_mode
+# has already exited if managed tables were declared by a non-root user), we
+# still hold exec/pfctl-unveil, and no privilege drop has happened -- so this
+# runs pfctl directly, needs no helper, and its die still reaches the terminal
+# like every other config error.
+verify_managed_tables_exist();
 
 # Check that state_dir is writable for the eventual runtime user
 # (root always can; non-root must be writable as the current user)
@@ -861,7 +871,7 @@ sub determine_privilege_mode {
 
     # Validate we have the privileges and users we need.
     if ($need_helper && !$running_as_root) {
-        die "faild.pl needs to run as root for failover or DHCP gateway types.\n";
+        die "faild.pl must run as root for failover, DHCP gateway types, or pf table management.\n";
     }
 
     # If running as root, we'll drop privileges - verify _faild exists
@@ -1037,6 +1047,28 @@ sub run_helper_cmd {
         my $exit = $? >> 8;
         return {status => 'err', reason => "exit $exit"};
     }
+}
+
+# List pf table names present in the active ruleset (one per line from
+# 'pfctl -sT'). Returns { status => 'ok', tables => [...] }. Read-only: it
+# never creates a table, so it is safe as an existence probe.
+sub list_pf_tables {
+    my $fh;
+    if (!open ($fh, '-|', $PFCTL, '-sT')) {
+        return {status => 'err', reason => "cannot run pfctl: $!"};
+    }
+    my @tables;
+    while (<$fh>) {
+        chomp;
+        s/^\s+//;
+        s/\s+$//;
+        push @tables, $_ if (length ($_));
+    }
+    close ($fh);
+    if ($? != 0) {
+        return {status => 'err', reason => "pfctl -sT failed (is pf enabled?)"};
+    }
+    return {status => 'ok', tables => \@tables};
 }
 
 # Get DHCP lease info - returns structured data
@@ -1971,6 +2003,28 @@ sub sync_managed_tables {
 	    my @want = ($current_state[$idx] == $UP) ? @dping_ips : ();
 	    replace_managed_table ($DYNAMIC_DPING_TABLE[$idx], @want);
 	}
+    }
+}
+
+# Verify every faild-managed pf table already exists in the active ruleset.
+# Called once at startup while still single-process and root (before daemonize
+# and privsep), so it runs pfctl directly -- no helper needed. faild populates
+# these tables but never creates them: they must be declared persistent in
+# pf.conf (e.g. "table <cox_gw> persist"). Checking here turns a
+# faild.conf/pf.conf mismatch into a clear terminal error at startup instead of
+# a per-cycle table-op failure once the daemon is detached.
+sub verify_managed_tables_exist {
+    return unless (%MANAGED_TABLES);
+    my $resp = list_pf_tables ();
+    if (!$resp || ($resp->{status} // '') ne 'ok') {
+	my $why = $resp ? ($resp->{reason} // 'unknown error') : 'no response';
+	die "Cannot verify pf tables exist: $why\n";
+    }
+    my %present = map { $_ => 1 } @{$resp->{tables} || []};
+    my @missing = grep { !$present{$_} } sort keys %MANAGED_TABLES;
+    if (@missing) {
+	die "pf table(s) not found in the active ruleset: " . join (', ', @missing) . ".\n" .
+	    "Declare each as a persistent table in pf.conf, e.g.: table <NAME> persist\n";
     }
 }
 
