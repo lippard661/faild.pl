@@ -4,7 +4,7 @@ Also can make routing changes and pf table changes to facilitate failover.
 
 Also found at https://www.discord.org/lippard/software/
 
-faild.pl 1.29 of 1 August 2026
+faild.pl 1.30 of 8 August 2026
 
 1.20 does privilege separation.
 1.19 replaces Net::Ping with system call to ping as preparation
@@ -25,13 +25,13 @@ Config file format (/etc/faild.conf):
  #distinctive_ping_tos: [tos value]
  #distinctive_ping_frequency: [2+] (minutes)
  # Then as many of these triplets as you want:
- gateway: &lt;ip&gt;
+ gateway: &lt;ip&gt; [for type ipv6-pd this must be a valid IPv6 IP but is just an identifier]
  #name: &lt;descriptive name&gt; # optional
 # gateway_table: &ltpf-table-name&gt; # optional (will add current next-hop gateway IP to pf table and keep it updated over IP address changes) - not valid on type: host
- interface: &lt;interface&gt; # optional, used by dhcplease-primary/backup
+ interface: &lt;interface&gt; # optional, used by dhcplease-primary/backup [required for ipv6-pd]
  routes: &lt;cidr&gt;,&ltcidr&gt,... # optional, only for dhcplease-primary/backup
- ping_ip: &lt;ip-list&gt; (1-3 comma-separated IPs)
- type: &lt;dedicated|dedicated-dhcplease-primary|dedicated-dhcplease-backup|on-demand|host&gt;
+ ping_ip: &lt;ip-list&gt; (1-3 comma-separated IPs) [IPv6 for types ipv6-tunnel and ipv6-pd]
+ type: &lt;dedicated|dedicated-dhcplease-primary|dedicated-dhcplease-backup|on-demand|host|ipv6-tunnel|ipv6-pd&gt;
  #dynamic_dping_table: &lt;pf-table-name&gt; # optional, only for dhcplease-backup, populated with IPs of hosts receiving distinctive pings and flushed if the backup interface goes down - use to force distinctive pings out backup interface in pf rules unless it's down
  #distinctive_pings: [yes|no] (valid only for host type)
  </PRE>

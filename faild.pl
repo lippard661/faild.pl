@@ -13,8 +13,15 @@
 # page_source: email-addr (where alerts are sent from)
 # page_destination: email-addr (where alerts are sent to)
 # perform_failover: [yes|no] (optional, default no)
+# distinctive_ping_len: [bytes] (optional, default may vary by OS)
+# distinctive_ping_ttl: [hop count, default 255] (optional)
+# distinctive_ping_tos: [TOS options, default none]
+# distinctive_ping_frequency: [minutes]
 # # Then as many of these triplets as you want:
 # gateway: <ip>
+# name: <name> (optional)
+# gateway_table: <pf-table-name> (optional, populated with next-hop gateway)
+# dynamic_dping_table: <pf-table-name> (optional, populated with distinctive ping destinations while the associated gateway is up, removed when it's down)
 # interface: <interface name> [optional, but needed for dhcplease]
 # routes: <cidr>, <cidr>, <cidr> [optional only for dhcplease, use "P" after
 #    cidr for permanent route that should not be removed if gateway goes down
@@ -22,7 +29,7 @@
 #         If multiple IPs are specified, the gateway is considered up if
 #         a ping to ANY of them succeeds. This allows tolerating individual
 #         ping target outages.
-# type: <dedicated|dedicated-dhcplease-primary|dedicated-dhcplease-backup|on-demand|host>
+# type: <dedicated|dedicated-dhcplease-primary|dedicated-dhcplease-backup|on-demand|host|ipv6-pd|ipv6-tunnel>
 
 # Issues/To Do:
 # (reworked)
@@ -99,6 +106,9 @@
 # 1.28 31 July 2026: Add name, gateway_table, dynamic_dping_table.
 # 1.29 1 August 2026: Update error message when run as non-privileged
 #    when pf table integration is used and add table existence check.
+# 1.30 8 August 2026: Add IPv6 monitoring: type: ipv6-tunnel and ipv6-pd
+#    entries (ping6 liveness, plus delegated-prefix change detection via
+#    dhcp6leasectl for ipv6-pd), and the depends_on alert-enrichment field.
 
 # ToDo: Some former "constants" are now variables from the config and should
 # consider moving them to the variables section and making them all
@@ -115,7 +125,7 @@ use IO::Handle;
 use JSON::PP;
 use POSIX;
 use Privileges::Drop;
-use Socket qw( AF_UNIX SOCK_STREAM PF_UNSPEC );
+use Socket qw( AF_UNIX SOCK_STREAM PF_UNSPEC AF_INET6 inet_pton inet_ntop );
 use Sys::Syslog;
 
 use if $^O eq "openbsd", "OpenBSD::Pledge";
@@ -123,7 +133,7 @@ use if $^O eq "openbsd", "OpenBSD::Unveil";
 
 ### Constants.
 
-my $VERSION = 'faild.pl 1.29 of 1 August 2026';
+my $VERSION = 'faild.pl 1.30 of 8 August 2026';
 
 # Pledge promise groups - stdio is added automatically by OpenBSD::Pledge
 my @READONLY_PROMISES     = ('rpath');
@@ -145,11 +155,15 @@ my $DEDICATED = 1;
 my $DEDICATED_DHCPLEASE_PRIMARY = 2;
 my $DEDICATED_DHCPLEASE_BACKUP = 3;
 my $HOST_CHECK = 4;
+my $IPV6_TUNNEL = 5;        # monitoring only: ping6 a tunnel far-side
+my $IPV6_PD = 6;           # monitoring only: ping6 liveness + PD prefix watch
 my @GATE_TYPE_NAME = ('',
 		      'Gateway',
 		      'Gateway (DHCP primary)',
 		      'Gateway (DHCP backup)',
-		      'Host');
+		      'Host',
+		      'IPv6 tunnel',
+		      'IPv6 prefix delegation');
 
 my $UP = 1;
 my $DOWN = 0;
@@ -211,6 +225,10 @@ foreach my $class (1 .. 4) {
 
 my (@GATEWAYS, @INTERFACES, @ROUTES, @PING_IPS, @GATE_TYPE, @DISTINCTIVE_PINGS);
 my (@NAMES, @GATEWAY_TABLE, @DYNAMIC_DPING_TABLE);
+# IPv6 monitoring state: @DEPENDS_ON holds an arrayref of entry names each entry
+# depends on (alert enrichment only, never control flow). @LAST_PREFIX holds the
+# last canonicalized delegated prefix seen for a PD entry, for change detection.
+my (@DEPENDS_ON, @LAST_PREFIX);
 # Whitelist of pf table names faild is allowed to manage, built in parse_config
 # (which runs as root before the privsep fork), so the privileged helper can
 # screen table-op requests against it independently of the monitor side.
@@ -223,9 +241,12 @@ my $FAILD_INFO; # default = '/var/db/faild.info';
 my $FAILD_PID; # default = '/var/run/faild.pid';
 
 my $DHCPLEASECTL = '/usr/sbin/dhcpleasectl';
+my $DHCP6LEASECTL = '/usr/sbin/dhcp6leasectl';
 my $PFCTL = '/sbin/pfctl';
 my $PING = '/sbin/ping';
 $PING = '/usr/bin/ping' if ($^O eq 'linux'); # Linux not supported for routing
+my $PING6 = '/sbin/ping6';
+$PING6 = '/usr/bin/ping6' if ($^O eq 'linux');
 my $ROUTE = '/sbin/route';
 my $SENDMAIL = '/usr/sbin/sendmail';
 
@@ -271,8 +292,10 @@ if ($^O eq "openbsd") {
     unveil ('/dev/log', 'rw');
     unveil ('/dev/null', 'rw');
     unveil ($DHCPLEASECTL, 'x');
+    unveil ($DHCP6LEASECTL, 'x');
     unveil ($PFCTL, 'x');
     unveil ($PING, 'x');
+    unveil ($PING6, 'x');
     unveil ($ROUTE, 'x');
     unveil ($SENDMAIL, 'x');
     # don't lock yet.
@@ -364,6 +387,7 @@ while (1) {
     ping_all_gateways();
     report_and_failover();
     sync_managed_tables();
+    check_ipv6_prefixes();
 
     if ($distinctive_pings_enabled &&
 	time() - $last_distinctive_ping_time >= $distinctive_ping_frequency * 60) {
@@ -384,6 +408,8 @@ exit;
 sub parse_config {
     my ($have_page_source, $have_page_destination, $gateway_idx, $have_interface, $have_routes, $have_ping_ip, $have_type, $have_distinctive_pings);
     my ($have_name, $have_gateway_table, $have_dynamic_dping_table);
+    my ($have_depends_on);
+    $have_depends_on = 0;
     $have_name = 0;
     $have_gateway_table = 0;
     $have_dynamic_dping_table = 0;
@@ -490,7 +516,7 @@ sub parse_config {
 		die "New gateway line when no interface specified for previous dedicated-dhcplease gateway. $_\n" if (!$have_interface && ($GATE_TYPE[$gateway_idx] == $DEDICATED_DHCPLEASE_PRIMARY ||
 																	   $GATE_TYPE[$gateway_idx] == $DEDICATED_DHCPLEASE_BACKUP));
 	    }
-	    if (is_ipaddr ($1)) {
+	    if (is_ipaddr ($1) || is_ip6addr ($1)) {
 		push (@GATEWAYS, $1);
 		$gateway_idx++;
 		$have_interface = 0;
@@ -501,9 +527,10 @@ sub parse_config {
 		$have_name = 0;
 		$have_gateway_table = 0;
 		$have_dynamic_dping_table = 0;
+		$have_depends_on = 0;
 	    }
 	    else {
-		die "gateway must be an IPv4 address. $_\n";
+		die "gateway must be an IPv4 or IPv6 address. $_\n";
 	    }
 	}
 	# Optional except for dedicated-dhcplease types.
@@ -545,7 +572,7 @@ sub parse_config {
 	    }
 	    my %seen;
 	    foreach my $ip (@ips) {
-		die "Invalid ping IP address. $ip\n" unless is_ipaddr($ip);
+		die "Invalid ping IP address. $ip\n" unless (is_ipaddr ($ip) || is_ip6addr ($ip));
 		die "Duplicate ping IP. $ip\n" if $seen{$ip}++;
 	    }
 	    $PING_IPS[$gateway_idx] = [@ips];
@@ -566,6 +593,12 @@ sub parse_config {
 	    }
 	    elsif ($1 eq 'host') {
 		push (@GATE_TYPE, $HOST_CHECK);
+	    }
+	    elsif ($1 eq 'ipv6-tunnel') {
+		push (@GATE_TYPE, $IPV6_TUNNEL);
+	    }
+	    elsif ($1 eq 'ipv6-pd') {
+		push (@GATE_TYPE, $IPV6_PD);
 	    }
 	    else {
 		die "Unrecognized type \"$1\". $_\n";
@@ -622,6 +655,24 @@ sub parse_config {
 	    $DYNAMIC_DPING_TABLE[$gateway_idx] = $val;
 	    $have_dynamic_dping_table = 1;
 	}
+	# Optional: names of other entries this one depends on. Used only to
+	# enrich this entry's alerts (shared-fate triage); never control flow.
+	# Resolved and cycle-checked in post-parse validation below.
+	elsif (/^\s*depends_on:\s*(.*)$/) {
+	    die "depends_on line before any gateway. $_\n" if ($gateway_idx < 0);
+	    die "Already have depends_on for gateway. $_\n" if ($have_depends_on);
+	    my @deps = split (/\s*,\s*/, $1);
+	    my %seen;
+	    foreach my $d (@deps) {
+		$d =~ s/^\s+//;
+		$d =~ s/\s+$//;
+		die "Empty name in depends_on. $_\n" if ($d eq '');
+		die "Duplicate name in depends_on: $d\n" if ($seen{$d}++);
+	    }
+	    die "depends_on lists no names. $_\n" unless (@deps);
+	    $DEPENDS_ON[$gateway_idx] = [@deps];
+	    $have_depends_on = 1;
+	}
 	else {
 	    die "Unrecognized line in config. $_\n";
 	}
@@ -665,10 +716,11 @@ sub parse_config {
 		die "distinctive_pings is only valid for type: host. ($GATEWAYS[$idx])\n";
 	    }
 	}
-	# gateway_table holds a gateway's next-hop; a host has none.
+	# gateway_table holds an IPv4 gateway's next-hop; only real IPv4
+	# gateways (not hosts, not IPv6 monitoring entries) have one.
 	if (defined ($GATEWAY_TABLE[$idx])) {
-	    if ($GATE_TYPE[$idx] == $HOST_CHECK) {
-		die "gateway_table is not valid for type: host. ($GATEWAYS[$idx])\n";
+	    if (!is_failover_candidate ($idx)) {
+		die "gateway_table is only valid for an IPv4 gateway. ($GATEWAYS[$idx])\n";
 	    }
 	    if ($MANAGED_TABLES{$GATEWAY_TABLE[$idx]}) {
 		die "pf table \"$GATEWAY_TABLE[$idx]\" is managed by more than one entry.\n";
@@ -684,6 +736,73 @@ sub parse_config {
 		die "pf table \"$DYNAMIC_DPING_TABLE[$idx]\" is managed by more than one entry.\n";
 	    }
 	    $MANAGED_TABLES{$DYNAMIC_DPING_TABLE[$idx]} = 1;
+	}
+	# IPv6 monitoring entries: gateway and every ping_ip must be IPv6;
+	# a PD entry needs an interface to read the delegated prefix from.
+	# Conversely, IPv4 entries must not carry IPv6 addresses.
+	if (is_ipv6_entry ($idx)) {
+	    die "gateway for an IPv6 entry must be an IPv6 address. ($GATEWAYS[$idx])\n"
+		unless (is_ip6addr ($GATEWAYS[$idx]));
+	    if (defined ($PING_IPS[$idx])) {
+		foreach my $ip (@{$PING_IPS[$idx]}) {
+		    die "ping_ip for an IPv6 entry must be an IPv6 address. ($ip)\n"
+			unless (is_ip6addr ($ip));
+		}
+	    }
+	    if ($GATE_TYPE[$idx] == $IPV6_PD && !defined ($INTERFACES[$idx])) {
+		die "type: ipv6-pd requires an interface (the dhcp6leased interface). ($GATEWAYS[$idx])\n";
+	    }
+	}
+	else {
+	    die "gateway for an IPv4 entry must be an IPv4 address. ($GATEWAYS[$idx])\n"
+		unless (is_ipaddr ($GATEWAYS[$idx]));
+	    if (defined ($PING_IPS[$idx])) {
+		foreach my $ip (@{$PING_IPS[$idx]}) {
+		    die "ping_ip for an IPv4 entry must be an IPv4 address. ($ip)\n"
+			unless (is_ipaddr ($ip));
+		}
+	    }
+	}
+    }
+
+    # Resolve depends_on names to configured entries and reject dangling
+    # references and cycles. This is alert-enrichment metadata only, but we
+    # fail loud at parse time rather than emit confusing runtime text.
+    {
+	my %name_to_idx;
+	for (my $idx = 0; $idx <= $#GATEWAYS; $idx++) {
+	    next unless (defined ($NAMES[$idx]));
+	    $name_to_idx{$NAMES[$idx]} = $idx;
+	}
+	for (my $idx = 0; $idx <= $#GATEWAYS; $idx++) {
+	    next unless (defined ($DEPENDS_ON[$idx]));
+	    foreach my $dep (@{$DEPENDS_ON[$idx]}) {
+		die "depends_on references unknown entry name \"$dep\". ($GATEWAYS[$idx])\n"
+		    unless (exists ($name_to_idx{$dep}));
+		die "depends_on cannot reference itself \"$dep\". ($GATEWAYS[$idx])\n"
+		    if ($name_to_idx{$dep} == $idx);
+	    }
+	}
+	# Detect cycles in the depends-on graph (harmless for the non-traversing
+	# alert text, but a cycle is a config error worth catching early).
+	my %color;   # 0/undef=white, 1=gray (on stack), 2=black (done)
+	my $visit;
+	$visit = sub {
+	    my ($i) = @_;
+	    return 0 if (($color{$i} // 0) == 2);
+	    return 1 if (($color{$i} // 0) == 1);   # back-edge => cycle
+	    $color{$i} = 1;
+	    if (defined ($DEPENDS_ON[$i])) {
+		foreach my $dep (@{$DEPENDS_ON[$i]}) {
+		    return 1 if ($visit->($name_to_idx{$dep}));
+		}
+	    }
+	    $color{$i} = 2;
+	    return 0;
+	};
+	for (my $idx = 0; $idx <= $#GATEWAYS; $idx++) {
+	    die "depends_on forms a cycle involving entry $idx ($GATEWAYS[$idx]).\n"
+		if ($visit->($idx));
 	}
     }
 
@@ -750,6 +869,52 @@ sub is_cidr {
     return 0 unless ($cidr =~ m{^([\d.]+)/(\d+)$});
     my ($ip, $bits) = ($1, $2);
     return is_ipaddr ($ip) && $bits >= 1 && $bits <= 32;
+}
+
+# Validate an IPv6 address using the system resolver's parser rather than a
+# hand-rolled regex (IPv6 text form is too subtle to get right by regex).
+# Note: inet_pton does not accept a zone/scope suffix (fe80::1%if0), so
+# link-local targets are not accepted here by design.
+sub is_ip6addr {
+    my ($addr) = @_;
+    return 0 unless defined ($addr);
+    return 0 if ($addr =~ /%/);            # reject scoped addresses explicitly
+    return defined (inet_pton (AF_INET6, $addr)) ? 1 : 0;
+}
+
+# Validate an IPv6 prefix in address/length form (e.g. 2600:8800:4901:940::/60).
+sub is_ip6prefix {
+    my ($prefix) = @_;
+    return 0 unless defined ($prefix);
+    return 0 unless ($prefix =~ m{^(.+)/(\d+)$});
+    my ($addr, $len) = ($1, $2);
+    return 0 unless (is_ip6addr ($addr));
+    return 0 unless ($len >= 1 && $len <= 128);
+    return 1;
+}
+
+# Canonicalize an IPv6 prefix to a stable comparable string: parse to bytes,
+# zero the host bits beyond the prefix length, and re-emit in canonical form.
+# This makes 2600:8800:4901:0940::/60 and 2600:8800:4901:940::/60 compare equal
+# and defends against cosmetic formatting differences in dhcp6leasectl output.
+# Returns undef on malformed input.
+sub canonical_ip6_prefix {
+    my ($addr, $len) = @_;
+    return undef unless (defined ($addr) && defined ($len));
+    return undef unless ($len =~ /^\d+$/ && $len >= 0 && $len <= 128);
+    my $bytes = inet_pton (AF_INET6, $addr);
+    return undef unless (defined ($bytes) && length ($bytes) == 16);
+    # Zero all bits at position >= $len across the 16-byte address.
+    my @b = unpack ('C16', $bytes);
+    for (my $bit = $len; $bit < 128; $bit++) {
+	my $byte = $bit >> 3;
+	my $mask = ~(1 << (7 - ($bit & 7))) & 0xFF;
+	$b[$byte] &= $mask;
+    }
+    my $masked = pack ('C16', @b);
+    my $canon = inet_ntop (AF_INET6, $masked);
+    return undef unless (defined ($canon));
+    return "$canon/$len";
 }
 
 # Subroutine to validate an interface.
@@ -834,6 +999,21 @@ sub build_ping_opts {
 	push (@opts, '-w', $timeout);
 	push (@opts, '-t', $ttl) if (defined ($ttl));
 	push (@opts, '-T', $tos) if (defined ($tos)); # keyword passed through
+    }
+    return @opts;
+}
+
+# Build options for an IPv6 liveness ping (ping6). No distinctive-ping options
+# are used for IPv6. NOTE: verify the timeout flag on your ping6 -- OpenBSD's
+# ping6 accepts -w (deadline); adjust here if your platform differs.
+sub build_ping6_opts {
+    my ($timeout) = @_;
+    my @opts = ('-c', '1');
+    if ($^O eq 'darwin') {
+	push (@opts, '-i', $timeout);   # macOS ping6 has no simple deadline flag
+    }
+    else { # openbsd, other BSDs, linux
+	push (@opts, '-w', $timeout);
     }
     return @opts;
 }
@@ -1024,6 +1204,11 @@ sub dispatch_command {
             unless (defined ($req->{interface}) && is_interface ($req->{interface}));
         return get_dhcp_info ($req->{interface});
     }
+    elsif ($cmd eq 'DHCP6LEASECTL_INFO') {
+        return {status => 'err', reason => 'bad interface'}
+            unless (defined ($req->{interface}) && is_interface ($req->{interface}));
+        return get_dhcp6_info ($req->{interface});
+    }
     else {
         return {status => 'err', reason => 'unknown command'};
     }
@@ -1139,6 +1324,51 @@ sub get_dhcp_info {
         push @missing, 'lease' unless defined $lease_seconds;
         return {status => 'err', reason => 'parse failed, missing: ' . join(',', @missing)};
     }
+}
+
+# Get DHCPv6 prefix-delegation info for an interface by parsing dhcp6leasectl.
+# Example output:
+#   igc0 [Bound]
+#   IA_PD 0: 2600:8800:4901:940::/60
+#   lease 24 hours
+# Returns { status, state, pds => [ {index, prefix, prefixlen}, ... ],
+# lease_seconds }. Parsing is deliberately lenient: an unreadable state or a
+# missing IA_PD is not an error here -- the caller decides (only a Bound lease
+# with a valid prefix is trusted; anything else means "hold last known").
+sub get_dhcp6_info {
+    my ($interface) = @_;
+    my $fh;
+    if (!open ($fh, '-|', $DHCP6LEASECTL, '-l', $interface)) {
+        return {status => 'err', reason => "cannot run dhcp6leasectl: $!"};
+    }
+    my $output = '';
+    while (<$fh>) { $output .= $_; }
+    close ($fh);
+
+    # Lease state appears in brackets on the interface line, e.g. "igc0 [Bound]".
+    my $state;
+    if ($output =~ /\[(\w+)\]/) {
+        $state = $1;
+    }
+
+    # Collect every IA_PD delegation line, e.g. "IA_PD 0: 2600:8800:4901:940::/60".
+    my @pds;
+    while ($output =~ /IA_PD\s+(\d+):\s+([0-9A-Fa-f:]+)\/(\d+)/g) {
+        push @pds, { index => $1, prefix => $2, prefixlen => $3 };
+    }
+
+    # Lease remaining, best-effort (same formats as the IPv4 path).
+    my $lease_seconds;
+    if ($output =~ /lease (\d+) hours?/) { $lease_seconds = $1 * 3600; }
+    elsif ($output =~ /lease (\d+) minutes?/) { $lease_seconds = $1 * 60; }
+    elsif ($output =~ /lease (\d+) seconds?/) { $lease_seconds = $1; }
+
+    return {
+        status => 'ok',
+        state => $state,
+        pds => \@pds,
+        lease_seconds => $lease_seconds,
+    };
 }
 
 ## Client-side subroutines (nonprivileged side, makes requests for privileged operations).
@@ -1395,12 +1625,12 @@ sub ping_all_gateways {
 		    $new_state[$idx] = $UP;
 		    $pings_down[$idx] = 0; # prevent miscount if it goes down in next minute
 		    print "$glabel is up on the $PING_NAME{$n_pings} ping.\n" if ($DEBUG);
-		    logmsg ('alert', "$glabel is up on the $PING_NAME{$n_pings} ping.") if ($n_pings > $N_PINGS_TO_NOTIFY);
+		    logmsg ('alert', "$glabel is up on the $PING_NAME{$n_pings} ping." . depends_suffix ($idx)) if ($n_pings > $N_PINGS_TO_NOTIFY);
 		    last;
 		}
 		else {
 		    print "$glabel is down on the $PING_NAME{$n_pings} ping.\n" if ($DEBUG);
-		    logmsg ('alert', "$glabel is down on the $PING_NAME{$n_pings} ping.") if ($n_pings > $N_PINGS_TO_NOTIFY);
+		    logmsg ('alert', "$glabel is down on the $PING_NAME{$n_pings} ping." . depends_suffix ($idx)) if ($n_pings > $N_PINGS_TO_NOTIFY);
 		    $pings_down[$idx] = $n_pings;
 		}
 	    }
@@ -1419,6 +1649,20 @@ sub get_dhcplease_info {
     }
     return ($resp->{ip}, $resp->{netmask}, $resp->{gateway}, 
             $resp->{lease_time}, $resp->{units});
+}
+
+# Query the privileged helper for an interface's DHCPv6 PD info. Returns the
+# helper's structured response ({state, pds, lease_seconds}) or undef on a
+# transport/helper failure (already logged).
+sub get_dhcp6_prefix {
+    my ($interface) = @_;
+    my $resp = helper_request (cmd => 'DHCP6LEASECTL_INFO', interface => $interface);
+    if (!$resp || ($resp->{status} // '') ne 'ok') {
+        my $reason = $resp ? ($resp->{reason} // 'unknown') : 'no response';
+        logmsg ('alert', "IPv6 PD info query for $interface failed: $reason");
+        return undef;
+    }
+    return $resp;
 }
 
 # Subroutine to report any state changes and failover to another
@@ -1539,11 +1783,11 @@ sub report_and_failover {
 	    $plural = 's';
 	    $plural = '' if ($duration == 1);
 	    if ($new_state[$idx] == $UP) {
-		logmsg ('alert', "$glabel is again reachable (down $duration minute$plural), $pings_down[$idx] failed pings.");
+		logmsg ('alert', "$glabel is again reachable (down $duration minute$plural), $pings_down[$idx] failed pings." . depends_suffix ($idx));
 		$pings_down[$idx] = 0; # reset counter
 		print "$glabel is again reachable (down $duration minute$plural).\n" if ($DEBUG);
 		if ($duration > 15) {
-		    send_page ("faild.pl: $glabel is again reachable (down $duration minute$plural).");
+		    send_page ("faild.pl: $glabel is again reachable (down $duration minute$plural)." . depends_suffix ($idx));
 		}
 		# A newly up gateway that we may or may not be switching to,
 		# depending on whether multiple were down.  We may end up
@@ -1564,7 +1808,7 @@ sub report_and_failover {
 		}
 	    }
 	    else {
-		logmsg ('alert', "$glabel has gone down (up $duration minute$plural).");
+		logmsg ('alert', "$glabel has gone down (up $duration minute$plural)." . depends_suffix ($idx));
 		print "$glabel has gone down (up $duration minute$plural).\n" if ($DEBUG);
 	    }
 	    $current_state[$idx] = $new_state[$idx];
@@ -1575,10 +1819,10 @@ sub report_and_failover {
 	    $duration = int ($duration / 60);
 	    $plural = 's';
 	    $plural = '' if ($duration == 1);
-	    logmsg ('alert', "$glabel has been down for $duration minute$plural.");
+	    logmsg ('alert', "$glabel has been down for $duration minute$plural." . depends_suffix ($idx));
 	    print "$glabel has been down for $duration minute$plural.\n" if ($DEBUG);
 	    if ($duration % 15 == 0 && $duration < 61) {
-		send_page ("faild.pl: $glabel has been down for $duration minutes.");
+		send_page ("faild.pl: $glabel has been down for $duration minutes." . depends_suffix ($idx));
 	    }
 	    # Add permanent routes if missing while down -- necessary to make
 	    # sure test pings still go out the right interface.
@@ -1619,7 +1863,7 @@ sub report_and_failover {
     # Determine if failback is possible (a higher-priority gateway is up)
     my $failback_possible = 0;
     for (my $idx = 0; $idx < $current_gateway; $idx++) {
-	if ($new_state[$idx] == $UP && $GATE_TYPE[$idx] != $HOST_CHECK) {
+	if ($new_state[$idx] == $UP && is_failover_candidate ($idx)) {
 	    $failback_possible = 1;
 	    last;
 	}
@@ -1639,7 +1883,7 @@ sub report_and_failover {
 	    # If there's more than one gateway but we're not performing
 	    # failover here, report the failover steps even though we aren't
 	    # doing it.
-	    elsif ($new_state[$idx] == $UP && $GATE_TYPE[$idx] != $HOST_CHECK) {
+	    elsif ($new_state[$idx] == $UP && is_failover_candidate ($idx)) {
 		if ($idx < $current_gateway) {
 		    logmsg ('alert', "Failing back from gateway $current_gateway ${\ gname($current_gateway)} to gateway $idx ${\ gname($idx)}.");
 		    print "Failing back from gateway $current_gateway ${\ gname($current_gateway)} to gateway $idx ${\ gname($idx)}.\n" if ($DEBUG);
@@ -1709,7 +1953,7 @@ sub report_and_failover {
 	# Check if there are actually any UP gateways (excluding HOST_CHECK)
 	my $any_gateway_up = 0;
 	for (my $idx = 0; $idx <= $#GATEWAYS; $idx++) {
-	    if ($new_state[$idx] == $UP && $GATE_TYPE[$idx] != $HOST_CHECK) {
+	    if ($new_state[$idx] == $UP && is_failover_candidate ($idx)) {
 		$any_gateway_up = 1;
 		last;
 	    }
@@ -1884,6 +2128,29 @@ sub gname {
 	                          : "($GATEWAYS[$idx])";
 }
 
+# Is this entry one of the IPv6 monitoring-only kinds? Such entries are pinged
+# for liveness but never participate in the IPv4 failover state machine.
+sub is_ipv6_entry {
+    my ($idx) = @_;
+    return ($GATE_TYPE[$idx] == $IPV6_TUNNEL || $GATE_TYPE[$idx] == $IPV6_PD);
+}
+
+# Is this entry a candidate to be the active (failover) default gateway? Only
+# real IPv4 gateways are -- not host checks and not IPv6 monitoring entries.
+sub is_failover_candidate {
+    my ($idx) = @_;
+    return ($GATE_TYPE[$idx] != $HOST_CHECK && !is_ipv6_entry ($idx));
+}
+
+# Alert-enrichment suffix naming this entry's declared dependencies, e.g.
+# " (depends on: cox)". Empty when no depends_on is configured. This affects
+# only the text of an alert; it never gates a probe or a state decision.
+sub depends_suffix {
+    my ($idx) = @_;
+    return '' unless (defined ($DEPENDS_ON[$idx]) && @{$DEPENDS_ON[$idx]});
+    return ' (depends on: ' . join (', ', @{$DEPENDS_ON[$idx]}) . ')';
+}
+
 sub logmsg {
     my ($level, $msg) = @_;
 
@@ -2035,6 +2302,67 @@ sub replace_managed_table {
 		cmd => 'PFCTL_TABLE_REPLACE', table => $table, ips => [@ips]);
 }
 
+# Detect and alert on delegated-prefix changes for every ipv6-pd entry. This is
+# pure detect-and-alert: it never touches pf, routes, or state. Discipline:
+#   - Only a Bound lease with a valid IA_PD is trusted; every other reading
+#     (renewing, no lease, unreadable state, empty IA_PD) means "hold the last
+#     known prefix and do not alert", so a mid-renewal glimpse can't false-fire.
+#   - Prefixes are compared canonicalized (bytes + length), not as printed text.
+#   - The first confident observation is recorded, not alerted as a change.
+sub check_ipv6_prefixes {
+    for (my $idx = 0; $idx <= $#GATEWAYS; $idx++) {
+	next unless ($GATE_TYPE[$idx] == $IPV6_PD);
+	next unless (defined ($INTERFACES[$idx]));
+
+	my $info = get_dhcp6_prefix ($INTERFACES[$idx]);
+	next unless (defined ($info));            # transport error already logged
+
+	my $state = $info->{state} // '';
+	if ($state ne 'Bound') {
+	    print "PD $idx ($INTERFACES[$idx]) state=$state; holding last known.\n" if ($DEBUG);
+	    next;
+	}
+	my @pds = @{$info->{pds} || []};
+	if (!@pds) {
+	    print "PD $idx: Bound but no IA_PD; holding last known.\n" if ($DEBUG);
+	    next;
+	}
+
+	# faild tracks a single prefix per entry: the lowest-indexed delegation.
+	# More than one is unexpected for this use and worth a one-time note.
+	my ($primary) = sort { $a->{index} <=> $b->{index} } @pds;
+	if (@pds > 1 && !$LAST_PREFIX[$idx]) {
+	    logmsg ('alert', gate_label ($idx) . ' has ' . scalar (@pds) .
+		    " IA_PD delegations; tracking index $primary->{index}." .
+		    depends_suffix ($idx));
+	}
+
+	my $canon = canonical_ip6_prefix ($primary->{prefix}, $primary->{prefixlen});
+	if (!defined ($canon)) {
+	    logmsg ('alert', gate_label ($idx) .
+		    " reported an unparseable delegated prefix " .
+		    "$primary->{prefix}/$primary->{prefixlen}." . depends_suffix ($idx));
+	    next;
+	}
+
+	if (!defined ($LAST_PREFIX[$idx])) {
+	    # First confident observation: record it, do not alert as a change.
+	    $LAST_PREFIX[$idx] = $canon;
+	    logmsg ('info', gate_label ($idx) . " initial delegated prefix $canon.");
+	    print "PD $idx initial prefix $canon.\n" if ($DEBUG);
+	}
+	elsif ($LAST_PREFIX[$idx] ne $canon) {
+	    my $old = $LAST_PREFIX[$idx];
+	    $LAST_PREFIX[$idx] = $canon;
+	    my $msg = gate_label ($idx) .
+		" IPv6 delegated prefix changed from $old to $canon." .
+		depends_suffix ($idx);
+	    logmsg ('alert', $msg);
+	    send_page ("faild.pl: $msg");
+	}
+    }
+}
+
 # Ping gateways or hosts.
 # Send a single ICMP ping using /sbin/ping. Returns 1 on success, 0 on failure.
 # This replaces Net::Ping which requires raw sockets (root privileges).
@@ -2042,18 +2370,27 @@ sub ping_host {
     my ($ip, $timeout, $len, $ttl, $tos) = @_;
     $timeout //= 1;
 
-    return 0 unless (!defined ($len) || ($len =~ /^\d+$/ &&
-					 $len >= 16 && $len <= 255));
+    # An IPv6 target (contains a colon) is pinged with ping6. Distinctive-ping
+    # options (len/ttl/tos) are IPv4-only and are ignored for IPv6 liveness.
+    my $v6 = ($ip =~ /:/) ? 1 : 0;
 
-    return 0 unless (!defined ($ttl) || ($ttl =~ /^\d+$/ &&
-					 $ttl > 1 &&
-					 $ttl <= 255));
+    if ($v6) {
+	return 0 unless (is_ip6addr ($ip));
+    }
+    else {
+	return 0 unless (!defined ($len) || ($len =~ /^\d+$/ &&
+					     $len >= 16 && $len <= 255));
 
-    return 0 unless (!defined ($tos) || valid_ping_tos ($tos));
-    
-    # Validate IP before passing to system command (defense in depth)
-    return 0 unless ($ip =~ /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/);
-    
+	return 0 unless (!defined ($ttl) || ($ttl =~ /^\d+$/ &&
+					     $ttl > 1 &&
+					     $ttl <= 255));
+
+	return 0 unless (!defined ($tos) || valid_ping_tos ($tos));
+
+	# Validate IP before passing to system command (defense in depth)
+	return 0 unless ($ip =~ /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/);
+    }
+
     my $pid = fork();
     if (!defined $pid) {
         logmsg ('alert', "fork failed for ping: $!");
@@ -2066,8 +2403,16 @@ sub ping_host {
         POSIX::dup2 (fileno($devnull), 1);
         POSIX::dup2 (fileno($devnull), 2);	
 	close ($devnull);
-	my @ping_opts = build_ping_opts ($timeout, $len, $ttl, $tos);
-        exec ($PING, @ping_opts, $ip);
+	my ($cmd, @ping_opts);
+	if ($v6) {
+	    $cmd = $PING6;
+	    @ping_opts = build_ping6_opts ($timeout);
+	}
+	else {
+	    $cmd = $PING;
+	    @ping_opts = build_ping_opts ($timeout, $len, $ttl, $tos);
+	}
+        exec ($cmd, @ping_opts, $ip);
         exit (1);  # only reached if exec fails
     }
     # Parent: wait for ping to complete
