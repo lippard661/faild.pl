@@ -1,0 +1,47 @@
+#!/bin/ksh
+#
+# $OpenBSD$
+#
+# rc.d(8) control script for faild.pl, the multi-WAN failover monitor.
+#
+# Install as /etc/rc.d/faild (mode 555, owner root:wheel), then:
+#     rcctl enable faild
+#     rcctl start faild
+# and remove any manual faild start from /etc/rc.local.
+#
+# Recommended safe (re)start, validating the config against the binary first:
+#     /usr/local/sbin/faild.pl -n && rcctl restart faild
+
+daemon="/usr/local/sbin/faild.pl"
+
+. /etc/rc.d/rc.subr
+
+# --- process matching -------------------------------------------------------
+# faild rewrites its process titles after forking, to "faild [priv]" (the
+# privileged helper) and "faild monitor" (the unprivileged worker). rc.subr's
+# default pexp is derived from $daemon (/usr/local/sbin/faild.pl), which no
+# longer appears in the process table once the titles are rewritten -- so the
+# default stop/restart/check matching would find nothing. Match the retitled
+# forms instead. VERIFY this against your own `ps -auxww | grep faild` output
+# and your installed rc.subr(8): the running processes must match this pexp.
+# (Killing either title suffices -- when the monitor exits, the helper exits
+# on the socket EOF -- but matching both makes stop deterministic.)
+pexp="faild \[priv\]|faild monitor"
+
+# faild self-backgrounds (its daemonize() parent exits promptly), so it is
+# started in the foreground and no rc_bg is needed. It runs as root and drops
+# its own privileges via privilege separation, so no daemon_user is set.
+
+# --- reload is deliberately unsupported -------------------------------------
+# faild has no SIGHUP reconfiguration path. The default rc.d reload action
+# sends SIGHUP, whose default disposition is to terminate the process, so a
+# reload would kill the daemon (the same trap that led OpenBSD to disable
+# rc.d reload for smtpd). Override reload to refuse cleanly. Use `restart`
+# for configuration changes and for installing a new faild version. faild
+# also ignores SIGHUP internally as a second line of defense.
+rc_reload() {
+	echo "${0##*/}: reload is not supported; use 'rcctl restart faild'" >&2
+	return 1
+}
+
+rc_cmd $1

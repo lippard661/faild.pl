@@ -4,8 +4,9 @@ Also can make routing changes and pf table changes to facilitate failover.
 
 Also found at https://www.discord.org/lippard/software/
 
-faild.pl 1.30 of 8 August 2026
+faild.pl 1.31 of 26 August 2026
 
+1.31 adds faild OpenBSD rc.d script and -n config test.
 1.20 does privilege separation.
 1.19 replaces Net::Ping with system call to ping as preparation
 for privilege separation; properly daemonizes.
