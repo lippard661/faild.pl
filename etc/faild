@@ -26,7 +26,7 @@ daemon="/usr/local/sbin/faild.pl"
 # and your installed rc.subr(8): the running processes must match this pexp.
 # (Killing either title suffices -- when the monitor exits, the helper exits
 # on the socket EOF -- but matching both makes stop deterministic.)
-pexp="faild \[priv\]|faild monitor"
+pexp="(perl: )?faild (\[priv\]|monitor).*"
 
 # faild self-backgrounds (its daemonize() parent exits promptly), so it is
 # started in the foreground and no rc_bg is needed. It runs as root and drops
