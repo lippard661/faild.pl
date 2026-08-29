@@ -4,7 +4,7 @@ Also can make routing changes and pf table changes to facilitate failover.
 
 Also found at https://www.discord.org/lippard/software/
 
-faild.pl 1.31 of 26 August 2026
+faild.pl 1.32 of 29 August 2026
 
 1.31 adds faild OpenBSD rc.d script and -n config test.
 1.20 does privilege separation.

@@ -109,6 +109,9 @@
 # 1.30 8 August 2026: Add IPv6 monitoring: type: ipv6-tunnel and ipv6-pd
 #    entries (ping6 liveness, plus delegated-prefix change detection via
 #    dhcp6leasectl for ipv6-pd), and the depends_on alert-enrichment field.
+# 1.31 26 August 2026: Add -n config-test mode; ignore SIGHUP (no reload
+#    path -- use restart for config or version changes).
+# 1.32 29 August 2026: Add subject with hostname to mailed/texted notifications.
 
 # ToDo: Some former "constants" are now variables from the config and should
 # consider moving them to the variables section and making them all
@@ -126,6 +129,7 @@ use JSON::PP;
 use POSIX;
 use Privileges::Drop;
 use Socket qw( AF_UNIX SOCK_STREAM PF_UNSPEC AF_INET6 inet_pton inet_ntop );
+use Sys::Hostname;
 use Sys::Syslog;
 
 use if $^O eq "openbsd", "OpenBSD::Pledge";
@@ -133,7 +137,7 @@ use if $^O eq "openbsd", "OpenBSD::Unveil";
 
 ### Constants.
 
-my $VERSION = 'faild.pl 1.30 of 8 August 2026';
+my $VERSION = 'faild.pl 1.31 of 26 August 2026';
 
 # Pledge promise groups - stdio is added automatically by OpenBSD::Pledge
 my @READONLY_PROMISES     = ('rpath');
@@ -164,6 +168,9 @@ my @GATE_TYPE_NAME = ('',
 		      'Host',
 		      'IPv6 tunnel',
 		      'IPv6 prefix delegation');
+
+my $HOSTNAME = hostname();
+my ($SHORT_HOSTNAME, $DOMAINNAME) = split (/\./, $HOSTNAME, 2);
 
 my $UP = 1;
 my $DOWN = 0;
@@ -275,8 +282,25 @@ if ($#ARGV == 0) {
 	print "$VERSION\n";
 	exit;
     }
+    elsif ($ARGV[0] eq '-n') {
+	# Config-test mode. Runs the exact same parse_config() path as real
+	# startup (which dies on the first error), so a pass here guarantees
+	# startup will accept the file. Prints the first error and exits
+	# non-zero on failure; prints OK and exits 0 on success. Deliberately
+	# stops at the first error rather than accumulating, to stay identical
+	# to the startup path and avoid cascading secondary errors.
+	my $ok = eval { parse_config (); 1 };
+	if ($ok) {
+	    print "faild.pl: configuration OK ($FAILD_CONF)\n";
+	    exit (0);
+	}
+	my $err = $@;
+	$err =~ s/\s+\z//;
+	print STDERR "faild.pl: configuration error: $err\n";
+	exit (1);
+    }
     else {
-	die "Usage: faild.pl [-v]\n";
+	die "Usage: faild.pl [-v|-n]\n";
     }
 }
 
@@ -372,6 +396,12 @@ $SIG{TERM} = sub {
     exit(0);
 };
 $SIG{INT} = $SIG{TERM};
+
+# faild has no SIGHUP reconfiguration path (use restart for config/version
+# changes). Ignore SIGHUP so a stray or rc.d-sent HUP can never kill the
+# daemon -- its default disposition is to terminate. Inherited across the
+# privsep fork, so both the helper and the monitor ignore it.
+$SIG{HUP} = 'IGNORE';
 
 write_pid();
 
@@ -2170,7 +2200,8 @@ sub send_page {
         return;
     }
     print MAIL "From: $PAGE_SOURCE\n";
-    print MAIL "To: $PAGE_DESTINATION\n\n";
+    print MAIL "To: $PAGE_DESTINATION\n";
+    print MAIL "Subject: $SHORT_HOSTNAME faild\n\n";
     print MAIL "$msg\n";
     close (MAIL);
 }
