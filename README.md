@@ -4,7 +4,7 @@ Also can make routing changes and pf table changes to facilitate failover.
 
 Also found at https://www.discord.org/lippard/software/
 
-faild.pl 1.32 of 29 August 2026
+faild.pl 1.33 of 11 October 2026
 
 1.31 adds faild OpenBSD rc.d script and -n config test.
 1.20 does privilege separation.
@@ -32,7 +32,8 @@ Config file format (/etc/faild.conf):
  interface: &lt;interface&gt; # optional, used by dhcplease-primary/backup [required for ipv6-pd]
  routes: &lt;cidr&gt;,&ltcidr&gt,... # optional, only for dhcplease-primary/backup
  ping_ip: &lt;ip-list&gt; (1-3 comma-separated IPs) [IPv6 for types ipv6-tunnel and ipv6-pd]
- type: &lt;dedicated|dedicated-dhcplease-primary|dedicated-dhcplease-backup|on-demand|host|ipv6-tunnel|ipv6-pd&gt;
+ type: &lt;dedicated|dedicated-dhcplease-primary|dedicated-dhcplease-backup|host|ipv6-tunnel|ipv6-pd&gt;
  #dynamic_dping_table: &lt;pf-table-name&gt; # optional, only for dhcplease-backup, populated with IPs of hosts receiving distinctive pings and flushed if the backup interface goes down - use to force distinctive pings out backup interface in pf rules unless it's down
  #distinctive_pings: [yes|no] (valid only for host type)
+ #depends_on: &ltinterface-name&gt; # optional, used for reporting purposes for ipv6-tunnel or ipv6-pd
  </PRE>
