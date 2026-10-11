@@ -131,6 +131,13 @@
 #    Linux uses ping -6 when there is no ping6. Config: fields before the
 #    first gateway: are rejected, duplicate name:/ipv6-pd interfaces
 #    rejected, sendmail failures logged.
+# 1.34 11 October 2026: Modified by Claude Opus 5.5 at the direction of Jim
+#    Lippard. Fix 1.33's false "/sbin/ping6 is not executable" on OpenBSD:
+#    Perl's -x is a stat(2), which needs unveil read permission, so ping6 and
+#    dhcp6leasectl are now unveiled rx (exec alone does not allow stat).
+#    -n now runs under the same pledge and unveil as startup (before, it ran
+#    outside them and passed what startup then failed). A non-default
+#    state_dir/pid_dir is unveiled before parse_config tests that it exists.
 
 # ToDo: Some former "constants" are now variables from the config and should
 # consider moving them to the variables section and making them all
@@ -156,7 +163,7 @@ use if $^O eq "openbsd", "OpenBSD::Unveil";
 
 ### Constants.
 
-my $VERSION = 'faild.pl 1.33 of 11 October 2026';
+my $VERSION = 'faild.pl 1.34 of 11 October 2026';
 
 # Pledge promise groups - stdio is added automatically by OpenBSD::Pledge
 my @READONLY_PROMISES     = ('rpath');
@@ -318,30 +325,16 @@ my $first_cycle = 1;
 
 ### Main program.
 
+my $config_test = 0;
 if ($#ARGV == 0) {
     if ($ARGV[0] eq '-v') {
 	print "$VERSION\n";
 	exit;
     }
     elsif ($ARGV[0] eq '-n') {
-	# Config-test mode. Runs the exact same parse_config() and
-	# startup_checks() as real startup (both die on the first error), so a
-	# pass here guarantees startup will accept the configuration on this
-	# host, including the privilege mode, the _faild user, the pf tables
-	# and state/pid directories. Run it as the user faild will start as
-	# (root, for rcctl). Prints the first error and exits non-zero on
-	# failure; prints OK and exits 0 on success. Deliberately stops at the
-	# first error rather than accumulating, to stay identical to the
-	# startup path and avoid cascading secondary errors.
-	my $ok = eval { parse_config (); startup_checks (); 1 };
-	if ($ok) {
-	    print "faild.pl: configuration OK ($FAILD_CONF)\n";
-	    exit (0);
-	}
-	my $err = $@;
-	$err =~ s/\s+\z//;
-	print STDERR "faild.pl: configuration error: $err\n";
-	exit (1);
+	# Config-test mode: handled below, after pledge and unveil, so that it
+	# runs under exactly the same restrictions as real startup.
+	$config_test = 1;
     }
     else {
 	die "Usage: faild.pl [-v|-n]\n";
@@ -350,7 +343,12 @@ if ($#ARGV == 0) {
 
 umask 022; # rw-r-r-
 
-# Pledge, Unveil.
+# Pledge, Unveil. The restriction takes effect at the first unveil() call,
+# not when the list is locked. Binaries that startup_checks() tests with -x
+# are unveiled 'rx', not just 'x': Perl's -x is a stat(2), and on OpenBSD
+# stat needs read permission on an unveiled path, so with 'x' alone -x
+# returns false for a binary that execs fine (1.33's "/sbin/ping6 is not
+# executable" on a host where it plainly was).
 if ($^O eq "openbsd") {
     pledge (@STARTUP_PROMISES) || die "Cannot pledge promises. $!\n";
     unveil ($FAILD_CONF, 'r');
@@ -360,21 +358,40 @@ if ($^O eq "openbsd") {
     unveil ('/dev/log', 'rw');
     unveil ('/dev/null', 'rw');
     unveil ($DHCPLEASECTL, 'x');
-    unveil ($DHCP6LEASECTL, 'x');
+    unveil ($DHCP6LEASECTL, 'rx');  # -x tested in startup_checks
     unveil ($PFCTL, 'x');
     unveil ($PING, 'x');
-    unveil ($PING6, 'x');
+    unveil ($PING6, 'rx');          # -x tested in startup_checks
     unveil ($ROUTE, 'x');
     unveil ($SENDMAIL, 'x');
     # don't lock yet.
 }
 
-parse_config();
-if ($^O eq 'openbsd') {
-    unveil ($STATE_DIR, 'rwc');
-    unveil ($PID_DIR, 'rwc');
-    unveil (); # done unveiling, lock it
+# Config-test mode. Runs the exact same parse_config(), unveil lock and
+# startup_checks() as real startup, under the same pledge and unveil (both
+# die on the first error), so a pass here guarantees startup will accept the
+# configuration on this host, including the privilege mode, the _faild
+# user, the pf tables, the binaries and the state/pid directories. (Before
+# 1.34 it ran before pledge and unveil, so it passed checks that startup
+# then failed.) Run it as the user faild will start as (root, for rcctl).
+# Prints the first error and exits non-zero on failure; prints OK and exits
+# 0 on success. Deliberately stops at the first error rather than
+# accumulating, to stay identical to the startup path and avoid cascading
+# secondary errors.
+if ($config_test) {
+    my $ok = eval { parse_config (); lock_unveil (); startup_checks (); 1 };
+    if ($ok) {
+	print "faild.pl: configuration OK ($FAILD_CONF)\n";
+	exit (0);
+    }
+    my $err = $@;
+    $err =~ s/\s+\z//;
+    print STDERR "faild.pl: configuration error: $err\n";
+    exit (1);
 }
+
+parse_config();
+lock_unveil();
 
 # Every check that can reject the configuration runs here, before daemonize
 # (so a failure reaches the terminal) and is shared with -n (so a -n pass
@@ -483,6 +500,10 @@ sub parse_config {
 	    $STATE_DIR =~ s|/+$||; # remove any trailing slashes
 	    die "Invalid state_dir path: $STATE_DIR\n"
 		unless ($STATE_DIR =~ m{^/[\w/.-]+$} && length ($STATE_DIR) < 256);
+	    # Unveil the configured directory before testing it: under unveil a
+	    # path outside the list stats as nonexistent (only the default is
+	    # unveiled before parse_config runs).
+	    unveil ($STATE_DIR, 'rwc') if ($^O eq 'openbsd');
 	    die "state_dir $STATE_DIR does not exist.\n" unless (-d $STATE_DIR);
 	}
 	elsif (/^\s*pid_dir:\s*(.*)$/) {
@@ -490,6 +511,7 @@ sub parse_config {
 	    $PID_DIR =~ s|/+$||; # remove any trailing slashes
 	    die "Invalid pid_dir path: $PID_DIR\n"
 		unless ($PID_DIR =~ m{^/[\w/.-]+$} && length ($PID_DIR) < 256);
+	    unveil ($PID_DIR, 'rwc') if ($^O eq 'openbsd');   # see state_dir
 	    die "pid_dir $PID_DIR does not exist.\n" unless (-d $PID_DIR);
 	}
 	elsif (/^\s*page_source:\s*(.*)$/) {
@@ -1087,6 +1109,15 @@ sub valid_routes {
 }
 
 ### Privilege separation subroutines.
+
+# Unveil the configured state and pid directories (known only after
+# parse_config) and lock the unveil list. Shared by startup and -n.
+sub lock_unveil {
+    return unless ($^O eq 'openbsd');
+    unveil ($STATE_DIR, 'rwc');
+    unveil ($PID_DIR, 'rwc');
+    unveil (); # done unveiling, lock it
+}
 
 # Every startup check that can reject a configuration, in one place so that
 # real startup and -n run exactly the same checks. Must be called after
